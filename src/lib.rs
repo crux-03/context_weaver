@@ -1,0 +1,763 @@
+//! # ContextWeaver
+//!
+//! A lorebook engine for LLM role-playing applications, built on
+//! [weaver-lang](../weaver_lang). ContextWeaver manages a collection of
+//! entries that are selectively activated based on conversation context
+//! and assembled into the final prompt sent to the model.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────┐
+//! │  Host Application (LLM frontend)                    │
+//! │                                                     │
+//! │  Provides: chat history, character data, user prefs │
+//! │  Receives: assembled context blocks for the prompt  │
+//! └────────────────────────┬────────────────────────────┘
+//!                          │
+//! ┌────────────────────────▼────────────────────────────┐
+//! │  ContextWeaver                                      │
+//! │                                                     │
+//! │  ┌─────────────┐  ┌────────────┐  ┌─────────────┐   │
+//! │  │  Lorebook   │  │ Activation │  │  Assembler  │   │
+//! │  │  (entries)  │──│  Engine    │──│  (ordering, │   │
+//! │  │             │  │            │  │   budgeting)│   │
+//! │  └─────────────┘  └────────────┘  └──────┬──────┘   │
+//! │                                          │          │
+//! │  ┌───────────────────────────────────────▼──────┐   │
+//! │  │  WeaverHost (EvalContext impl)               │   │
+//! │  │  - namespace management                      │   │
+//! │  │  - read-only enforcement                     │   │
+//! │  │  - trigger collection (no output)            │   │
+//! │  │  - document → recursive entry evaluation     │   │
+//! │  └──────────────────────────────────────────────┘   │
+//! │                                                     │
+//! │  ┌──────────────────────────────────────────────┐   │
+//! │  │  Plugin Interface                            │   │
+//! │  │  - custom processors & commands              │   │
+//! │  │  - activation hooks                          │   │
+//! │  └──────────────────────────────────────────────┘   │
+//! └─────────────────────────────────────────────────────┘
+//!                          │
+//! ┌────────────────────────▼────────────────────────────┐
+//! │  weaver-lang (template evaluation)                  │
+//! └─────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Quick start
+//!
+//! ```rust,ignore
+//! use context_weaver::{ContextWeaver, Lorebook, ChatMessage, Slot};
+//!
+//! // Load a lorebook from disk
+//! let book = Lorebook::load_from_directory("./my_character/lorebook")?;
+//!
+//! // Configure the engine
+//! let mut weaver = ContextWeaver::new(book);
+//! weaver.set_variable("char", "name", "Aria");
+//! weaver.set_variable("char", "class", "Mage");
+//! weaver.set_variable("user", "name", "Player");
+//!
+//! // Provide conversation context
+//! let messages = vec![
+//!     ChatMessage::user("I walk into the dark forest"),
+//!     ChatMessage::assistant("The trees close in around you..."),
+//! ];
+//!
+//! // Assemble activated entries into context blocks
+//! let blocks = weaver.assemble(&messages)?;
+//! for block in &blocks {
+//!     println!("[{}] {}", block.slot, block.content);
+//! }
+//! ```
+
+pub mod activation;
+pub mod assembler;
+pub mod entry;
+pub mod host;
+pub mod lifecycle;
+pub mod lorebook;
+pub mod plugin;
+#[cfg(feature = "stdlib")]
+pub mod stdlib;
+
+pub use activation::{ActivationEngine, ActivationReason, ActivationResult, ActivationState};
+pub use assembler::{
+    AssembledBlock, ContextAssembler, GuesstimationTokenizer, Slot, TokenBudget, Tokenizer,
+};
+pub use entry::{Entry, EntryMeta};
+pub use host::{NamespaceAccess, NamespaceConfig, WeaverHost};
+pub use lifecycle::{
+    FnLifecycle, HookError, LifecyclePlugin, PostActivationCtx, PostAssembleCtx, PostEvaluateCtx,
+    PreActivationCtx, PreEvaluateCtx, TriggerCtx, TurnAdvanceCtx,
+};
+pub use lorebook::{Lorebook, LorebookConfig};
+pub use plugin::Plugin;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use weaver_lang::registry::{CommandSignature, ParamDef, WeaverCommand};
+use weaver_lang::{CompiledTemplate, EvalContext, EvalError, Registry, Value};
+
+// ── Top-level engine ────────────────────────────────────────────────────
+
+/// The main entry point for ContextWeaver.
+///
+/// Owns a [`Lorebook`], manages the [`Registry`] and [`WeaverHost`],
+/// and orchestrates the activation → evaluation → assembly pipeline.
+pub struct ContextWeaver {
+    lorebook: Lorebook,
+    registry: Registry,
+    host: WeaverHost,
+    activation_state: ActivationState,
+    config: EngineConfig,
+    /// The tokenizer used for budget estimation.
+    tokenizer: Box<dyn Tokenizer>,
+    /// Which slots are available in the host's ContextDefinition template.
+    /// Entries targeting unavailable slots (with no matching fallback) are dropped.
+    available_slots: HashSet<Slot>,
+    /// Lifecycle plugins registered to hook into the assembly pipeline.
+    /// Fired in registration order; see the [`lifecycle`] module for details.
+    lifecycle_plugins: Vec<Box<dyn LifecyclePlugin>>,
+}
+
+/// A chat message provided by the host application for activation scanning.
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    User,
+    Assistant,
+    System,
+}
+
+impl ChatMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: content.into(),
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::System,
+            content: content.into(),
+        }
+    }
+}
+
+/// Top-level engine configuration.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Maximum recursion depth for document chains.
+    pub max_recursion_depth: usize,
+    /// Maximum number of entries that can activate per assembly pass.
+    pub max_active_entries: usize,
+    /// Number of trigger-resolution passes (trigger output activating
+    /// further entries).
+    pub max_trigger_passes: usize,
+    /// Whether to use lenient evaluation (pass through errors as raw syntax).
+    pub lenient: bool,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            max_recursion_depth: 10,
+            max_active_entries: 100,
+            max_trigger_passes: 3,
+            lenient: false,
+        }
+    }
+}
+
+impl ContextWeaver {
+    pub fn new(lorebook: Lorebook) -> Self {
+        let mut host = WeaverHost::from_lorebook_config(&lorebook.config);
+        let mut registry = Registry::new();
+
+        // Register built-in commands and processors
+        register_builtins(&mut registry);
+
+        // Set max recursion depth from default config
+        host.set_max_recursion_depth(EngineConfig::default().max_recursion_depth);
+
+        Self {
+            lorebook,
+            registry,
+            host,
+            activation_state: ActivationState::new(),
+            config: EngineConfig::default(),
+            tokenizer: Box::new(GuesstimationTokenizer),
+            available_slots: Slot::standard_slots().into_iter().collect(),
+            lifecycle_plugins: Vec::new(),
+        }
+    }
+
+    pub fn with_config(mut self, config: EngineConfig) -> Self {
+        self.host
+            .set_max_recursion_depth(config.max_recursion_depth);
+        self.config = config;
+        self
+    }
+
+    /// Set a custom tokenizer for accurate token budget enforcement.
+    ///
+    /// The default is [`GuesstimationTokenizer`] which estimates ~4 chars
+    /// per token. For production use, provide a tokenizer that matches
+    /// your target model (tiktoken, sentencepiece, etc.).
+    pub fn set_tokenizer(&mut self, tokenizer: Box<dyn Tokenizer>) {
+        self.tokenizer = tokenizer;
+    }
+
+    /// Set which slots are available in the host's ContextDefinition.
+    ///
+    /// Entries targeting slots not in this set (and with no matching
+    /// fallback) will be silently dropped during assembly. By default,
+    /// all standard slots are available.
+    pub fn set_available_slots(&mut self, slots: impl IntoIterator<Item = Slot>) {
+        self.available_slots = slots.into_iter().collect();
+    }
+
+    /// Set a variable in a host-provided namespace.
+    ///
+    /// This is how the host application feeds data into the lorebook:
+    /// character attributes, user preferences, world state, etc.
+    pub fn set_variable(&mut self, scope: &str, name: &str, value: impl Into<Value>) {
+        self.host.set_host_variable(scope, name, value.into());
+    }
+
+    /// Register a plugin, adding its processors and commands to the registry.
+    pub fn register_plugin(&mut self, plugin: impl Plugin) -> Result<(), plugin::PluginError> {
+        plugin.register(&mut self.registry);
+        plugin.init()
+    }
+
+    pub fn register_lifecycle<P: LifecyclePlugin + 'static>(&mut self, plugin: P) {
+        self.lifecycle_plugins.push(Box::new(plugin));
+    }
+
+    /// Access the activation state (for serialization / inspection).
+    pub fn activation_state(&self) -> &ActivationState {
+        &self.activation_state
+    }
+
+    /// Restore activation state (e.g. from a save file).
+    pub fn restore_activation_state(&mut self, state: ActivationState) {
+        self.activation_state = state;
+    }
+
+    /// Access the host's persistent state (for serialization).
+    pub fn persistent_state(&self) -> &HashMap<String, Value> {
+        self.host.persistent_state()
+    }
+
+    /// Restore persistent state (e.g. from a save file).
+    pub fn restore_persistent_state(&mut self, state: HashMap<String, Value>) {
+        self.host.restore_persistent_state(state);
+    }
+
+    /// Advance the turn counter. Call this once per conversation turn,
+    /// before `assemble`. Decrements sticky counters and clears
+    /// transient variables.
+    pub fn advance_turn(&mut self) -> Result<(), ContextWeaverError> {
+        self.activation_state.advance_turn();
+        self.host.clear_transient();
+
+        // ── Lifecycle: on_turn_advance ──────────────────────────────
+        let state = &mut self.activation_state;
+        for plugin in &mut self.lifecycle_plugins {
+            let plugin_name = plugin.name().to_string();
+            let mut ctx = TurnAdvanceCtx { state };
+            plugin
+                .on_turn_advance(&mut ctx)
+                .map_err(|e| ContextWeaverError::PluginHook {
+                    plugin: plugin_name,
+                    hook: "on_turn_advance",
+                    source: e,
+                })?;
+        }
+
+        Ok(())
+    }
+
+    /// Run the full pipeline: activate → evaluate → assemble.
+    ///
+    /// Returns ordered context blocks ready for prompt insertion.
+    pub fn assemble(
+        &mut self,
+        messages: &[ChatMessage],
+    ) -> Result<Vec<AssembledBlock>, ContextWeaverError> {
+        // Clone messages so pre_activation hooks can mutate.
+        let mut messages_owned: Vec<ChatMessage> = messages.to_vec();
+        let turn = self.activation_state.current_turn();
+
+        // ── Lifecycle: pre_activation ───────────────────────────────
+        for plugin in &mut self.lifecycle_plugins {
+            let plugin_name = plugin.name().to_string();
+            let mut ctx = PreActivationCtx {
+                messages: &mut messages_owned,
+                turn,
+            };
+            plugin
+                .pre_activation(&mut ctx)
+                .map_err(|e| ContextWeaverError::PluginHook {
+                    plugin: plugin_name,
+                    hook: "pre_activation",
+                    source: e,
+                })?;
+        }
+
+        // ── Prepare host for evaluation ─────────────────────────────
+        let entry_templates = self.build_template_map();
+        self.host.set_entry_templates(entry_templates);
+
+        // ── Phase 1: Activation scan ────────────────────────────────
+        let mut results = ActivationEngine::scan(
+            &self.lorebook,
+            messages,
+            &mut self.host,
+            &self.registry,
+            &self.activation_state,
+        );
+
+        // ── Lifecycle: post_activation ──────────────────────────────
+        {
+            let lifecycle_plugins = &mut self.lifecycle_plugins;
+            let lorebook = &self.lorebook;
+            for plugin in lifecycle_plugins {
+                let plugin_name = plugin.name().to_string();
+                let mut ctx = PostActivationCtx {
+                    results: &mut results,
+                    lorebook,
+                    turn,
+                };
+                plugin
+                    .post_activation(&mut ctx)
+                    .map_err(|e| ContextWeaverError::PluginHook {
+                        plugin: plugin_name,
+                        hook: "post_activation",
+                        source: e,
+                    })?;
+            }
+        }
+
+        // Enforce max active entries
+        if results.len() > self.config.max_active_entries {
+            results.truncate(self.config.max_active_entries);
+        }
+
+        let mut active_ids: Vec<String> = results.iter().map(|r| r.entry_id.clone()).collect();
+
+        // Tell the host which entries are active (for trigger dedup and
+        // the is_active command via the _active namespace)
+        self.host
+            .set_active_entries(active_ids.iter().cloned().collect());
+
+        // ── Phase 2: Evaluate + trigger resolution passes ───────────
+        //
+        // Each pass evaluates entries and captures both their output AND
+        // any trigger side effects. Already-evaluated entries are NOT
+        // re-evaluated — their cached output is reused. This prevents
+        // side effects (inc_var, set_var, push_var) from running twice.
+        //
+        // Each pass:
+        //   1. Evaluate un-evaluated entries, caching output
+        //   2. Drain triggered IDs from host
+        //   3. Filter through cooldown/conditions
+        //   4. Add newly activated entries to the list, repeat
+        let mut evaluated_cache: HashMap<String, EvaluatedEntry> = HashMap::new();
+
+        // Evaluate the initial batch and cache results
+        for entry in self.evaluate_entries(&active_ids)? {
+            evaluated_cache.insert(entry.id.clone(), entry);
+        }
+
+        for pass_number in 0..self.config.max_trigger_passes {
+            // Drain trigger activations collected during evaluation
+            let mut triggered = self.host.drain_triggered_entries();
+            if triggered.is_empty() {
+                break;
+            }
+
+            // ── Lifecycle: on_trigger_fired ─────────────────────────
+            for plugin in &mut self.lifecycle_plugins {
+                let plugin_name = plugin.name().to_string();
+                let mut ctx = TriggerCtx {
+                    triggered_ids: &mut triggered,
+                    pass_number,
+                };
+                plugin
+                    .on_trigger_fired(&mut ctx)
+                    .map_err(|e| ContextWeaverError::PluginHook {
+                        plugin: plugin_name,
+                        hook: "on_trigger_fired",
+                        source: e,
+                    })?;
+            }
+
+            // Filter through activation rules
+            let new_results = ActivationEngine::filter_triggered(
+                &self.lorebook,
+                &triggered,
+                &active_ids,
+                &mut self.host,
+                &self.registry,
+                &self.activation_state,
+            );
+
+            if new_results.is_empty() {
+                break;
+            }
+
+            // Collect truly new entry IDs (skip entries already in
+            // active_ids — they may be sticky refreshes that don't need
+            // re-evaluation or duplicate list entries)
+            let new_ids: Vec<String> = new_results
+                .iter()
+                .map(|r| r.entry_id.clone())
+                .filter(|id| !active_ids.contains(id))
+                .collect();
+
+            for id in &new_ids {
+                active_ids.push(id.clone());
+            }
+            results.extend(new_results);
+
+            // Update host's active set
+            self.host
+                .set_active_entries(active_ids.iter().cloned().collect());
+
+            // Evaluate ONLY the truly new entries (not sticky refreshes)
+            if !new_ids.is_empty() {
+                for entry in self.evaluate_entries(&new_ids)? {
+                    evaluated_cache.insert(entry.id.clone(), entry);
+                }
+            }
+
+            if active_ids.len() > self.config.max_active_entries {
+                active_ids.truncate(self.config.max_active_entries);
+                break;
+            }
+        }
+
+        // ── Phase 3: Collect evaluated entries in activation order ───
+        let evaluated: Vec<EvaluatedEntry> = active_ids
+            .iter()
+            .filter_map(|id| evaluated_cache.remove(id))
+            .collect();
+
+        // ── Phase 4: Record activations ─────────────────────────────
+        //
+        // Only record FRESH activations (keyword, regex, constant,
+        // triggered) — not sticky carry-forwards. This ensures that
+        // carry-forwards don't reset the sticky countdown, while fresh
+        // re-activations (keyword re-match, trigger refresh) DO reset it.
+        //
+        // When an entry appears multiple times in `results` (e.g. once
+        // as Sticky carry-forward, once as Triggered refresh), the
+        // non-Sticky entry takes precedence here because we iterate
+        // all results and the last `record_activation` call wins.
+        for result in &results {
+            if matches!(result.reason, ActivationReason::Sticky { .. }) {
+                continue;
+            }
+            if let Some(entry) = self.lorebook.get_entry(&result.entry_id) {
+                self.activation_state
+                    .record_activation(&result.entry_id, entry.meta.sticky_turns);
+            }
+        }
+
+        // ── Phase 5: Assemble ───────────────────────────────────────
+        let mut blocks = ContextAssembler::assemble(
+            evaluated,
+            &self.lorebook.config,
+            &*self.tokenizer,
+            &self.available_slots,
+        );
+
+        // ── Lifecycle: post_assemble ────────────────────────────────
+        {
+            let lifecycle_plugins = &mut self.lifecycle_plugins;
+            let lorebook = &self.lorebook;
+            for plugin in lifecycle_plugins {
+                let plugin_name = plugin.name().to_string();
+                let mut ctx = PostAssembleCtx {
+                    blocks: &mut blocks,
+                    lorebook,
+                };
+                plugin
+                    .post_assemble(&mut ctx)
+                    .map_err(|e| ContextWeaverError::PluginHook {
+                        plugin: plugin_name,
+                        hook: "post_assemble",
+                        source: e,
+                    })?;
+            }
+        }
+
+        Ok(blocks)
+    }
+
+    /// Build the entry ID → Arc<CompiledTemplate> map for the host.
+    fn build_template_map(&self) -> HashMap<String, Arc<CompiledTemplate>> {
+        self.lorebook
+            .entries_in_order()
+            .map(|e| (e.meta.id.clone(), e.compiled.clone()))
+            .collect()
+    }
+
+    /// Evaluate all active entries and collect their output.
+    fn evaluate_entries(
+        &mut self,
+        entry_ids: &[String],
+    ) -> Result<Vec<EvaluatedEntry>, ContextWeaverError> {
+        let mut results = Vec::new();
+
+        for id in entry_ids {
+            if let Some(entry) = self.lorebook.get_entry(id).cloned() {
+                if let Some(content) = self.evaluate_single_entry(&entry)? {
+                    results.push(EvaluatedEntry {
+                        id: id.clone(),
+                        meta: entry.meta.clone(),
+                        content,
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Evaluate a single entry's template against the current host state.
+    /// Returns `Ok(None)` if a `pre_evaluate` hook set `skip = true`.
+    fn evaluate_single_entry(
+        &mut self,
+        entry: &Entry,
+    ) -> Result<Option<String>, ContextWeaverError> {
+        // ── Lifecycle: pre_evaluate ─────────────────────────────────
+        let mut skip = false;
+        for plugin in &mut self.lifecycle_plugins {
+            let plugin_name = plugin.name().to_string();
+            let mut ctx = PreEvaluateCtx {
+                entry,
+                skip: &mut skip,
+            };
+            plugin
+                .pre_evaluate(&mut ctx)
+                .map_err(|e| ContextWeaverError::PluginHook {
+                    plugin: plugin_name,
+                    hook: "pre_evaluate",
+                    source: e,
+                })?;
+        }
+        if skip {
+            return Ok(None);
+        }
+
+        // ── Evaluate ────────────────────────────────────────────────
+        self.host.begin_entry(&entry.meta.id);
+
+        let opts = weaver_lang::EvalOptions::new()
+            .max_node_evaluations(50_000)
+            .max_iterations(10_000)
+            .lenient(self.config.lenient);
+
+        let result = weaver_lang::evaluate_with_options(
+            entry.compiled.ast(),
+            &mut self.host,
+            &self.registry,
+            opts,
+        );
+
+        self.host.end_entry();
+
+        let mut content = result.map_err(|e| ContextWeaverError::Eval {
+            entry_id: entry.meta.id.clone(),
+            source: e,
+        })?;
+
+        // ── Lifecycle: post_evaluate ────────────────────────────────
+        for plugin in &mut self.lifecycle_plugins {
+            let plugin_name = plugin.name().to_string();
+            let mut ctx = PostEvaluateCtx {
+                entry,
+                content: &mut content,
+            };
+            plugin
+                .post_evaluate(&mut ctx)
+                .map_err(|e| ContextWeaverError::PluginHook {
+                    plugin: plugin_name,
+                    hook: "post_evaluate",
+                    source: e,
+                })?;
+        }
+
+        Ok(Some(content))
+    }
+}
+
+/// An entry that has been evaluated to its final string content.
+pub struct EvaluatedEntry {
+    pub id: String,
+    pub meta: EntryMeta,
+    pub content: String,
+}
+
+// ── Errors ──────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum ContextWeaverError {
+    /// Failed to parse an entry's frontmatter.
+    MetaParse { entry_path: String, message: String },
+    /// Failed to parse an entry's weaver-lang body.
+    TemplateParse {
+        entry_id: String,
+        errors: Vec<weaver_lang::ParseError>,
+    },
+    /// Failed during template evaluation.
+    Eval {
+        entry_id: String,
+        source: weaver_lang::EvalError,
+    },
+    /// A document reference hit the recursion limit.
+    RecursionLimit { entry_id: String, depth: usize },
+    /// I/O error loading lorebook files.
+    Io(std::io::Error),
+    PluginHook {
+        plugin: String,
+        hook: &'static str,
+        source: HookError,
+    },
+}
+
+impl std::fmt::Display for ContextWeaverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MetaParse {
+                entry_path,
+                message,
+            } => {
+                write!(f, "metadata parse error in {entry_path}: {message}")
+            }
+            Self::TemplateParse { entry_id, errors } => {
+                write!(f, "template parse error in entry '{entry_id}':")?;
+                for e in errors {
+                    write!(f, "\n  {e}")?;
+                }
+                Ok(())
+            }
+            Self::Eval { entry_id, source } => {
+                write!(f, "evaluation error in entry '{entry_id}': {source}")
+            }
+            Self::RecursionLimit { entry_id, depth } => {
+                write!(f, "recursion limit ({depth}) hit from entry '{entry_id}'")
+            }
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::PluginHook {
+                plugin,
+                hook,
+                source,
+            } => {
+                write!(f, "lifecycle plugin '{plugin}' failed in {hook}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ContextWeaverError {}
+
+impl From<std::io::Error> for ContextWeaverError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+// ── Built-in commands & processors ──────────────────────────────────────
+
+fn register_builtins(registry: &mut Registry) {
+    // When the stdlib feature is enabled, register the full standard library.
+    // Otherwise, register minimal placeholders.
+    #[cfg(feature = "stdlib")]
+    {
+        stdlib::register(registry);
+    }
+
+    #[cfg(not(feature = "stdlib"))]
+    {
+        // Minimal built-in set when stdlib is disabled.
+        registry.register_processor(weaver_lang::ClosureProcessor::new(
+            "text",
+            "upper",
+            |props| {
+                let text = props.get("text").and_then(|v| v.as_string()).unwrap_or("");
+                Ok(Value::String(text.to_uppercase()))
+            },
+        ));
+        registry.register_processor(weaver_lang::ClosureProcessor::new(
+            "text",
+            "lower",
+            |props| {
+                let text = props.get("text").and_then(|v| v.as_string()).unwrap_or("");
+                Ok(Value::String(text.to_lowercase()))
+            },
+        ));
+    }
+
+    // $[is_active("entry_id")] — check if an entry is currently active.
+    // Uses the _active namespace populated by WeaverHost::set_active_entries.
+    registry.register_command(IsActiveCommand);
+}
+
+// ── is_active command ──────────────────────────────────────────────────
+
+/// `$[is_active("entry_id")]` — check if a lorebook entry is active
+/// in the current evaluation pass.
+///
+/// Returns `true` if the entry ID is in the active set, `false`
+/// otherwise. Works by reading the `_active` namespace which the
+/// engine populates before evaluation.
+struct IsActiveCommand;
+
+impl WeaverCommand for IsActiveCommand {
+    fn call(
+        &self,
+        args: Vec<Value>,
+        ctx: &mut dyn EvalContext,
+        _registry: &Registry,
+    ) -> Result<Option<Value>, EvalError> {
+        let id = args.first().and_then(|v| v.as_string()).ok_or_else(|| {
+            EvalError::type_error("string", args.first().map_or("none", |v| v.type_name()))
+        })?;
+
+        let is_active = ctx
+            .resolve_variable("_active", id)?
+            .is_some_and(|v| v.is_truthy());
+
+        Ok(Some(Value::Bool(is_active)))
+    }
+
+    fn signature(&self) -> CommandSignature {
+        CommandSignature {
+            name: "is_active".to_string(),
+            params: vec![ParamDef {
+                name: "entry_id".to_string(),
+                expected_type: Some(weaver_lang::registry::ValueType::String),
+                required: true,
+            }],
+        }
+    }
+}

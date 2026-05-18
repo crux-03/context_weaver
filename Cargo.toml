@@ -1,0 +1,20 @@
+[package]
+name = "context_weaver"
+version = "0.1.0"
+edition = "2024"
+description = "A lorebook engine for LLM role-playing applications, built on weaver_lang"
+
+[features]
+default = ["stdlib"]
+stdlib = []
+
+[dependencies]
+weaver_lang = { version="0.3.1", features = ["macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+regex = "1"
+serde_json = "1.0.149"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3"
