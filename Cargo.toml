@@ -1,7 +1,7 @@
 [package]
 name = "context_weaver"
 authors = ["crux03"]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A lorebook engine for LLM role-playing applications, built on weaver_lang"
 license = "MIT"

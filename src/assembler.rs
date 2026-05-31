@@ -14,25 +14,22 @@
 //!
 //! ```text
 //! ┌─────────────────────────────┐
-//! │  preamble                   │  ← world axioms, framing rules
-//! │  foundation                 │  ← core lore, character backstory
-//! │  context                    │  ← situational scene info
-//! │  reference                  │  ← supporting material, style guides
-//! │  framing                    │  ← scene mood, active mode
-//! │  guidance                   │  ← behavior rules, quest objectives
-//! │  emphasis                   │  ← active effects, high-attention
+//! │  prelude                    │  ← world axioms, meta-instructions
+//! │  preamble                   │  ← core lore, character backstory
+//! │  backdrop                   │  ← supporting material, stable world state
+//! │  setting                    │  ← situational scene info, current location
+//! │  foreground                 │  ← active effects, urgent reminders near chat
 //! │  [chat messages...]         │
-//! │  immediate                  │  ← urgent reminders near chat
+//! │  coda                       │  ← post-chat notes, summaries
 //! │  at_depth(N)                │  ← injected N msgs from end
-//! │  aftermath                  │  ← post-chat notes, summaries
 //! └─────────────────────────────┘
 //! ```
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::lorebook::LorebookConfig;
 use crate::EvaluatedEntry;
+use crate::lorebook::LorebookConfig;
 
 // ── Slot ────────────────────────────────────────────────────────────────
 
@@ -47,24 +44,18 @@ use crate::EvaluatedEntry;
 #[serde(rename_all = "snake_case")]
 pub enum Slot {
     /// The absolute top. World axioms, universal rules, meta-instructions.
-    Preamble,
+    Prelude,
     /// Core background. Setting lore, character backstory, stable world state.
-    Foundation,
+    Preamble,
     /// Situational context. Scene descriptions, current location, active relationships.
     #[default]
-    Context,
+    Backdrop,
     /// Supporting material. Style guides, secondary character info, historical events.
-    Reference,
+    Setting,
     /// Sets the mode for upcoming content. "You are in combat", "this scene is quiet".
-    Framing,
+    Foreground,
     /// Instructions and constraints. Behavior rules, tone directives, quest objectives.
-    Guidance,
-    /// High-visibility content near chat. Active effects, ongoing conditions.
-    Emphasis,
-    /// As close to the latest messages as possible. Urgent reminders, don't-forget items.
-    Immediate,
-    /// After the chat messages. Summaries, narrator notes, follow-up context.
-    Aftermath,
+    Coda,
     /// Injected N messages from the end of the chat history.
     /// Handled separately from slot resolution during final prompt construction.
     #[serde(rename = "at_depth")]
@@ -75,31 +66,25 @@ impl Slot {
     /// Numeric ordering index for sorting. Lower = earlier in prompt.
     fn order_index(&self) -> usize {
         match self {
-            Self::Preamble => 0,
-            Self::Foundation => 1,
-            Self::Context => 2,
-            Self::Reference => 3,
-            Self::Framing => 4,
-            Self::Guidance => 5,
-            Self::Emphasis => 6,
-            Self::Immediate => 7,
-            Self::Aftermath => 8,
-            Self::AtDepth(_) => 9,
+            Self::Prelude => 0,
+            Self::Preamble => 1,
+            Self::Backdrop => 2,
+            Self::Setting => 3,
+            Self::Foreground => 4,
+            Self::Coda => 5,
+            Self::AtDepth(_) => 6,
         }
     }
 
     /// All standard slot variants (excluding `AtDepth`).
     pub fn standard_slots() -> Vec<Slot> {
         vec![
+            Self::Prelude,
             Self::Preamble,
-            Self::Foundation,
-            Self::Context,
-            Self::Reference,
-            Self::Framing,
-            Self::Guidance,
-            Self::Emphasis,
-            Self::Immediate,
-            Self::Aftermath,
+            Self::Backdrop,
+            Self::Setting,
+            Self::Foreground,
+            Self::Coda,
         ]
     }
 }
@@ -122,15 +107,12 @@ impl PartialOrd for Slot {
 impl std::fmt::Display for Slot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Prelude => write!(f, "prelude"),
             Self::Preamble => write!(f, "preamble"),
-            Self::Foundation => write!(f, "foundation"),
-            Self::Context => write!(f, "context"),
-            Self::Reference => write!(f, "reference"),
-            Self::Framing => write!(f, "framing"),
-            Self::Guidance => write!(f, "guidance"),
-            Self::Emphasis => write!(f, "emphasis"),
-            Self::Immediate => write!(f, "immediate"),
-            Self::Aftermath => write!(f, "aftermath"),
+            Self::Backdrop => write!(f, "backdrop"),
+            Self::Setting => write!(f, "setting"),
+            Self::Foreground => write!(f, "foreground"),
+            Self::Coda => write!(f, "coda"),
             Self::AtDepth(n) => write!(f, "at_depth({n})"),
         }
     }
@@ -405,23 +387,23 @@ mod tests {
 
     #[test]
     fn test_slot_resolution_primary() {
-        let available = HashSet::from([Slot::Foundation, Slot::Context]);
+        let available = HashSet::from([Slot::Backdrop, Slot::Preamble]);
         assert_eq!(
-            resolve_slot(&Slot::Foundation, &[], &available),
-            Some(Slot::Foundation)
+            resolve_slot(&Slot::Backdrop, &[], &available),
+            Some(Slot::Backdrop)
         );
     }
 
     #[test]
     fn test_slot_resolution_fallback() {
-        let available = HashSet::from([Slot::Context]);
+        let available = HashSet::from([Slot::Backdrop]);
         assert_eq!(
             resolve_slot(
-                &Slot::Foundation,
-                &[Slot::Context, Slot::Preamble],
+                &Slot::Coda,
+                &[Slot::Backdrop, Slot::Preamble],
                 &available,
             ),
-            Some(Slot::Context)
+            Some(Slot::Backdrop)
         );
     }
 
@@ -429,7 +411,7 @@ mod tests {
     fn test_slot_resolution_none_available() {
         let available = HashSet::from([Slot::Preamble]);
         assert_eq!(
-            resolve_slot(&Slot::Foundation, &[Slot::Context], &available),
+            resolve_slot(&Slot::Coda, &[Slot::Backdrop], &available),
             None
         );
     }
@@ -446,19 +428,19 @@ mod tests {
     #[test]
     fn test_slot_ordering() {
         let mut slots = vec![
-            Slot::Aftermath,
+            Slot::Setting,
             Slot::Preamble,
-            Slot::Emphasis,
-            Slot::Foundation,
+            Slot::Prelude,
+            Slot::Backdrop,
         ];
         slots.sort();
         assert_eq!(
             slots,
             vec![
+                Slot::Prelude,
                 Slot::Preamble,
-                Slot::Foundation,
-                Slot::Emphasis,
-                Slot::Aftermath
+                Slot::Backdrop,
+                Slot::Setting
             ]
         );
     }

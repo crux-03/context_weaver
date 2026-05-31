@@ -59,7 +59,7 @@ name: Dark Forest Description
 keywords: ["dark forest", "shadowed path"]
 condition: '{{state:location}} == "forest"'
 priority: 150
-slot: foundation
+slot: coda
 ---
 {# if {{state:level}} > 5 #}
 The ancient dark forest recognizes a seasoned adventurer.
@@ -77,7 +77,7 @@ id: combat_system
 name: Combat System
 regex: ['\b(attack|fight|strike|slash)\b']
 priority: 180
-slot: framing
+slot: preamble
 ---
 === COMBAT ===
 {# if {{state:weapon}} == "none" #}
@@ -100,7 +100,7 @@ id: merchant_encounter
 name: Merchant Encounter
 keywords: ["merchant", "shop", "trader"]
 priority: 140
-slot: context
+slot: backdrop
 ---
 The merchant greets you warmly.
 $[set_var("state:quest_started", true)]
@@ -119,7 +119,7 @@ id: quest_log
 name: Quest Log
 condition: '{{state:quest_started}}'
 priority: 130
-slot: context
+slot: backdrop
 ---
 --- QUEST ACTIVATED ---
 [[quest_details]]"#;
@@ -142,7 +142,7 @@ id: level_up
 name: Level Up
 keywords: ["level up", "leveled up"]
 priority: 160
-slot: context
+slot: backdrop
 ---
 $[inc_var("state:level", 1)]
 $[inc_var("state:gold", 25)]
@@ -162,7 +162,7 @@ id: inventory_entry
 name: Inventory
 keywords: ["inventory", "items", "backpack"]
 priority: 120
-slot: context
+slot: backdrop
 ---
 === INVENTORY (@[array.length(items: {{state:inventory}})] items) ===
 {# foreach item in {{state:inventory}} #}
@@ -178,7 +178,7 @@ name: Special Move
 keywords: ["special move"]
 cooldown: 2
 priority: 110
-slot: aftermath
+slot: coda
 ---
 You execute a devastating special move!"#;
 
@@ -190,7 +190,7 @@ name: Sacred Oath
 keywords: ["sacred oath"]
 sticky_turns: 2
 priority: 105
-slot: framing
+slot: preamble
 ---
 [Oath active] Your sacred oath empowers you."#;
 
@@ -203,7 +203,7 @@ name: Veteran Bonus
 constant: true
 condition: '({{state:level}} >= 3) && ({{state:visited_forest}})'
 priority: 90
-slot: reference
+slot: coda
 ---
 [Veteran bonus: +10% damage in familiar territory]"#;
 
@@ -214,7 +214,7 @@ id: event_log
 name: Event Logger
 constant: true
 priority: 50
-slot: aftermath
+slot: setting
 ---
 $[push_var("state:event_log", "turn")]"#;
 
@@ -360,7 +360,7 @@ fn test_multi_turn_rpg_session() {
     let world_block = find_block(&blocks, "world_rules").unwrap();
     assert_eq!(world_block.slot, Slot::Preamble);
     let forest_block = find_block(&blocks, "forest_desc").unwrap();
-    assert_eq!(forest_block.slot, Slot::Foundation);
+    assert_eq!(forest_block.slot, Slot::Coda);
 
     // state:visited_forest should have been set by forest_desc
     let state = engine.persistent_state();
@@ -974,7 +974,7 @@ fn test_assembly_ordering() {
 id: high_prio
 constant: true
 priority: 200
-slot: context
+slot: backdrop
 ---
 HIGH"#,
         None,
@@ -986,7 +986,7 @@ HIGH"#,
 id: low_prio
 constant: true
 priority: 50
-slot: context
+slot: backdrop
 ---
 LOW"#,
         None,
@@ -1019,7 +1019,7 @@ FIRST"#,
 
     assert!(
         early_idx < high_idx,
-        "preamble should precede context in output. Order: {:?}",
+        "preamble should precede backdrop in output. Order: {:?}",
         positions
     );
 
@@ -1042,8 +1042,8 @@ fn test_slot_fallback_resolution() {
         r#"---
 id: fallback_entry
 constant: true
-slot: reference
-fallback: [context]
+slot: coda
+fallback: [backdrop]
 ---
 Fallback content"#,
         None,
@@ -1054,15 +1054,15 @@ Fallback content"#,
 
     let mut engine = ContextWeaver::new(book);
 
-    // Only make preamble and context available (no reference)
-    engine.set_available_slots(vec![Slot::Preamble, Slot::Context, Slot::Aftermath]);
+    // Only make preamble and context available (no coda)
+    engine.set_available_slots(vec![Slot::Preamble, Slot::Backdrop, Slot::Setting]);
 
     let blocks = engine.assemble(&[]).unwrap();
 
     let block = find_block(&blocks, "fallback_entry").expect("entry should be active via fallback");
     assert_eq!(
         block.slot,
-        Slot::Context,
+        Slot::Backdrop,
         "entry should have fallen back to context slot"
     );
 }
@@ -1076,7 +1076,7 @@ fn test_unavailable_slot_drops_entry() {
         r#"---
 id: no_slot_entry
 constant: true
-slot: emphasis
+slot: setting
 ---
 This should be dropped"#,
         None,

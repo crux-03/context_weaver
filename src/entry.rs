@@ -248,7 +248,7 @@ mod tests {
 id: test_entry
 name: Test Entry
 keywords: ["hello", "world"]
-slot: foundation
+slot: coda
 priority: 50
 ---
 Hello, {{char:name}}!
@@ -257,7 +257,7 @@ Hello, {{char:name}}!
         assert_eq!(entry.meta.id, "test_entry");
         assert_eq!(entry.meta.keywords, vec!["hello", "world"]);
         assert_eq!(entry.meta.priority, 50);
-        assert_eq!(entry.meta.slot, Slot::Foundation);
+        assert_eq!(entry.meta.slot, Slot::Coda);
     }
 
     #[test]
@@ -272,7 +272,7 @@ content
         assert!(entry.meta.enabled);
         assert!(entry.meta.keywords.is_empty());
         assert!(!entry.meta.constant);
-        assert_eq!(entry.meta.slot, Slot::Context); // new default
+        assert_eq!(entry.meta.slot, Slot::Backdrop); // default
         assert!(entry.meta.fallback.is_empty());
     }
 
@@ -280,14 +280,14 @@ content
     fn test_fallback_parsed() {
         let source = r#"---
 id: with_fallback
-slot: reference
-fallback: [context, foundation]
+slot: preamble
+fallback: [backdrop, coda]
 ---
 content
 "#;
         let entry = Entry::parse(source, None).unwrap();
-        assert_eq!(entry.meta.slot, Slot::Reference);
-        assert_eq!(entry.meta.fallback, vec![Slot::Context, Slot::Foundation]);
+        assert_eq!(entry.meta.slot, Slot::Preamble);
+        assert_eq!(entry.meta.fallback, vec![Slot::Backdrop, Slot::Coda]);
     }
 
     #[test]
