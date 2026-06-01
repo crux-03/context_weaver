@@ -14,8 +14,9 @@ use std::sync::Arc;
 use weaver_lang::Value;
 use weaver_lang::{CompiledTemplate, EvalContext, EvalError, EvalErrorKind, Registry};
 
+use crate::lorebook::BookId;
 use crate::lorebook::LorebookConfig;
-use crate::resolver::{DefaultIdResolver, IdResolver};
+use crate::resolver::{BookTemplates, DefaultIdResolver, IdResolver};
 
 // ── Namespace access control ────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ pub struct WeaverHost {
 
     /// Set of entry IDs currently being evaluated — used for cycle detection
     /// in recursive document resolution.
-    eval_stack: Vec<String>,
+    eval_stack: Vec<(BookId, String)>,
 
     /// Maximum recursion depth for document chains.
     max_recursion_depth: usize,
@@ -67,10 +68,9 @@ pub struct WeaverHost {
     /// The entry currently being evaluated (for diagnostics).
     current_entry: Option<String>,
 
-    /// Compiled entry templates, keyed by entry ID. Set before each
-    /// evaluation pass so that `resolve_document` can evaluate entries
-    /// inline.
-    entry_templates: HashMap<String, Arc<CompiledTemplate>>,
+    /// Compiled entry templates, partitioned by book. Replaced each
+    /// evaluation pass so `resolve_document` can evaluate entries inline.
+    book_templates: BookTemplates,
 
     /// Entry IDs activated via `<trigger>` during the current evaluation
     /// pass. The engine drains this after evaluation to feed the next
@@ -99,7 +99,7 @@ impl WeaverHost {
             max_recursion_depth: 10,
             active_entries: HashSet::new(),
             current_entry: None,
-            entry_templates: HashMap::new(),
+            book_templates: BookTemplates::new(),
             triggered_entries: Vec::new(),
             resolver: Box::new(DefaultIdResolver),
         }
@@ -153,12 +153,18 @@ impl WeaverHost {
 
     // ── Entry template management ───────────────────────────────────
 
-    /// Provide compiled templates for document resolution.
-    ///
-    /// Called by the engine before each evaluation pass. Templates are
-    /// shared via `Arc` to avoid cloning ASTs.
+    /// Provide templates for a single book (wraps them as book 0).
+    /// Convenience for single-book callers and tests.
     pub fn set_entry_templates(&mut self, templates: HashMap<String, Arc<CompiledTemplate>>) {
-        self.entry_templates = templates;
+        let mut books = BookTemplates::new();
+        books.push(templates);
+        self.book_templates = books;
+    }
+
+    /// Provide book-partitioned templates for document resolution.
+    /// Called by the engine before each evaluation pass.
+    pub fn set_book_templates(&mut self, templates: BookTemplates) {
+        self.book_templates = templates;
     }
 
     // ── Trigger collection ──────────────────────────────────────────
@@ -176,15 +182,15 @@ impl WeaverHost {
 
     /// Called before evaluating an entry — pushes onto the eval stack
     /// for cycle detection.
-    pub fn begin_entry(&mut self, entry_id: &str) {
+    pub fn begin_entry(&mut self, book: BookId, entry_id: &str) {
         self.current_entry = Some(entry_id.to_string());
-        self.eval_stack.push(entry_id.to_string());
+        self.eval_stack.push((book, entry_id.to_string()));
     }
 
     /// Called after evaluating an entry — pops from the eval stack.
     pub fn end_entry(&mut self) {
         self.eval_stack.pop();
-        self.current_entry = self.eval_stack.last().cloned();
+        self.current_entry = self.eval_stack.last().map(|(_, id)| id.clone());
     }
 
     // ── Persistent state ────────────────────────────────────────────
@@ -289,14 +295,35 @@ impl EvalContext for WeaverHost {
         document_id: &str,
         registry: &Registry,
     ) -> Result<String, EvalError> {
-        // ── Cycle detection ────────────────────────────────────────
-        if self.eval_stack.contains(&document_id.to_string()) {
+        // The currently-evaluating entry's book is the "local" book:
+        // references resolve there first, then fall back to other books.
+        let origin = self.eval_stack.last().map(|(book, _)| *book);
+
+        // ── Resolve id → (book, template) ─────────────────────────
+        let resolved = self
+            .resolver
+            .resolve(document_id, origin, &self.book_templates)
+            .ok_or_else(|| {
+                EvalError::new(
+                    EvalErrorKind::DocumentNotFound,
+                    format!("unknown document: {document_id}"),
+                )
+            })?;
+        let book = resolved.book;
+        let template = resolved.template.clone(); // Arc clone — cheap
+
+        // ── Cycle detection (book-qualified) ──────────────────────
+        let frame = (book, document_id.to_string());
+        if self.eval_stack.contains(&frame) {
+            let trail = self
+                .eval_stack
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ");
             return Err(EvalError::new(
                 EvalErrorKind::HostError,
-                format!(
-                    "document cycle detected: {} → {document_id}",
-                    self.eval_stack.join(" → ")
-                ),
+                format!("document cycle detected: {trail} → {document_id}"),
             ));
         }
 
@@ -311,19 +338,8 @@ impl EvalContext for WeaverHost {
             ));
         }
 
-        // ── Look up and evaluate ──────────────────────────────────
-        let template = self
-            .resolver
-            .resolve(document_id, &self.entry_templates)
-            .ok_or_else(|| {
-                EvalError::new(
-                    EvalErrorKind::DocumentNotFound,
-                    format!("unknown document: {document_id}"),
-                )
-            })?
-            .clone(); // Arc clone — cheap
-
-        self.eval_stack.push(document_id.to_string());
+        // ── Evaluate ──────────────────────────────────────────────
+        self.eval_stack.push(frame);
         let result = weaver_lang::evaluate(template.ast(), self, registry);
         self.eval_stack.pop();
 
@@ -547,7 +563,7 @@ mod tests {
         let template = Arc::new(CompiledTemplate::compile("self-reference").unwrap());
         host.set_entry_templates(HashMap::from([("entry_a".to_string(), template)]));
 
-        host.eval_stack.push("entry_a".to_string());
+        host.eval_stack.push((BookId(0), "entry_a".to_string()));
         let result = host.resolve_document("entry_a", &registry);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("cycle"));
@@ -559,8 +575,8 @@ mod tests {
         host.set_max_recursion_depth(2);
         let registry = Registry::new();
 
-        host.eval_stack.push("a".to_string());
-        host.eval_stack.push("b".to_string());
+        host.eval_stack.push((BookId(0), "a".to_string()));
+        host.eval_stack.push((BookId(0), "b".to_string()));
 
         let template = Arc::new(CompiledTemplate::compile("deep").unwrap());
         host.set_entry_templates(HashMap::from([("c".to_string(), template)]));
@@ -593,10 +609,15 @@ mod tests {
             fn resolve<'a>(
                 &self,
                 _id: &str,
-                templates: &'a HashMap<String, Arc<CompiledTemplate>>,
-            ) -> Option<&'a Arc<CompiledTemplate>> {
-                // Redirect every id to the canonical entry.
-                templates.get("canonical")
+                _origin: Option<BookId>,
+                books: &'a BookTemplates,
+            ) -> Option<crate::resolver::ResolvedRef<'a>> {
+                books
+                    .get(BookId(0), "canonical")
+                    .map(|template| crate::resolver::ResolvedRef {
+                        book: BookId(0),
+                        template,
+                    })
             }
         }
 
@@ -608,5 +629,46 @@ mod tests {
 
         let result = host.resolve_document("anything", &Registry::new()).unwrap();
         assert_eq!(result, "canonical content");
+    }
+
+    #[test]
+    fn test_resolve_prefers_local_book() {
+        let mut host = make_host();
+        let mut books = BookTemplates::new();
+        books.push(HashMap::from([(
+            "shared".to_string(),
+            Arc::new(CompiledTemplate::compile("from book 0").unwrap()),
+        )]));
+        books.push(HashMap::from([(
+            "shared".to_string(),
+            Arc::new(CompiledTemplate::compile("from book 1").unwrap()),
+        )]));
+        host.set_book_templates(books);
+
+        // A reference fired from book 1 picks book 1's "shared".
+        host.begin_entry(BookId(1), "caller");
+        let result = host.resolve_document("shared", &Registry::new()).unwrap();
+        host.end_entry();
+        assert_eq!(result, "from book 1");
+    }
+
+    #[test]
+    fn test_resolve_falls_back_to_other_books() {
+        let mut host = make_host();
+        let mut books = BookTemplates::new();
+        books.push(HashMap::from([(
+            "only_here".to_string(),
+            Arc::new(CompiledTemplate::compile("found in book 0").unwrap()),
+        )]));
+        books.push(HashMap::new()); // book 1 has nothing
+        host.set_book_templates(books);
+
+        // Book 1 lacks "only_here" → falls back to book 0.
+        host.begin_entry(BookId(1), "caller");
+        let result = host
+            .resolve_document("only_here", &Registry::new())
+            .unwrap();
+        host.end_entry();
+        assert_eq!(result, "found in book 0");
     }
 }

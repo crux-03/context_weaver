@@ -92,9 +92,9 @@ pub use lifecycle::{
     FnLifecycle, HookError, LifecyclePlugin, PostActivationCtx, PostAssembleCtx, PostEvaluateCtx,
     PreActivationCtx, PreEvaluateCtx, TriggerCtx, TurnAdvanceCtx,
 };
-pub use lorebook::{Lorebook, LorebookConfig};
+pub use lorebook::{BookId, Lorebook, LorebookConfig};
 pub use plugin::Plugin;
-pub use resolver::{DefaultIdResolver, IdResolver};
+pub use resolver::{BookTemplates, DefaultIdResolver, IdResolver, ResolvedRef};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -324,7 +324,7 @@ impl ContextWeaver {
         }
 
         // ── Prepare host for evaluation ─────────────────────────────
-        let entry_templates = self.build_template_map();
+        let entry_templates = self.build_book_templates();
         self.host.set_entry_templates(entry_templates);
 
         // ── Phase 1: Activation scan ────────────────────────────────
@@ -514,8 +514,8 @@ impl ContextWeaver {
         Ok(blocks)
     }
 
-    /// Build the entry ID → Arc<CompiledTemplate> map for the host.
-    fn build_template_map(&self) -> HashMap<String, Arc<CompiledTemplate>> {
+    /// Build the per-book template store for the host (single book for now).
+    fn build_book_templates(&self) -> HashMap<String, Arc<CompiledTemplate>> {
         self.lorebook
             .entries_in_order()
             .map(|e| (e.meta.id.clone(), e.compiled.clone()))
@@ -571,7 +571,7 @@ impl ContextWeaver {
         }
 
         // ── Evaluate ────────────────────────────────────────────────
-        self.host.begin_entry(&entry.meta.id);
+        self.host.begin_entry(BookId(0), &entry.meta.id);
 
         let opts = weaver_lang::EvalOptions::new()
             .max_node_evaluations(50_000)

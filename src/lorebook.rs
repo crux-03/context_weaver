@@ -19,12 +19,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::ContextWeaverError;
 use crate::assembler::Slot;
 use crate::entry::Entry;
 use crate::host::NamespaceConfig;
-use crate::ContextWeaverError;
 
 // ── Lorebook ────────────────────────────────────────────────────────────
+
+/// Stable handle identifying a lorebook within a set. Assigned by
+/// registration order (the first book added is `BookId(0)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BookId(pub usize);
 
 pub struct Lorebook {
     pub config: LorebookConfig,
