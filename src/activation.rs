@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 use weaver_lang::{CompiledExpr, Registry};
 
-use crate::host::WeaverHost;
-use crate::lorebook::Lorebook;
 use crate::ChatMessage;
+use crate::host::WeaverHost;
+use crate::lorebook::{BookId, Lorebook, LorebookSet};
 
 // ── Activation result ───────────────────────────────────────────────────
 
@@ -46,6 +46,7 @@ pub enum ActivationReason {
 /// The result of an activation scan for a single entry.
 #[derive(Debug)]
 pub struct ActivationResult {
+    pub book: BookId,
     pub entry_id: String,
     pub reason: ActivationReason,
     pub priority: i32,
@@ -194,6 +195,7 @@ impl ActivationEngine {
                     seen.insert(meta.id.clone());
                     sticky_carry.remove(&meta.id);
                     activated.push(ActivationResult {
+                        book: BookId(0),
                         entry_id: meta.id.clone(),
                         reason: ActivationReason::Constant,
                         priority: meta.priority,
@@ -244,6 +246,7 @@ impl ActivationEngine {
                     seen.insert(meta.id.clone());
                     sticky_carry.remove(&meta.id);
                     activated.push(ActivationResult {
+                        book: BookId(0),
                         entry_id: meta.id.clone(),
                         reason,
                         priority: meta.priority,
@@ -256,6 +259,7 @@ impl ActivationEngine {
         for (id, (remaining, priority)) in sticky_carry {
             if !seen.contains(&id) {
                 activated.push(ActivationResult {
+                    book: BookId(0),
                     entry_id: id,
                     reason: ActivationReason::Sticky {
                         remaining_turns: remaining,
@@ -276,35 +280,36 @@ impl ActivationEngine {
     /// Called after an evaluation pass drains trigger IDs from the host.
     /// Applies cooldown and condition checks to the triggered candidates.
     pub fn filter_triggered(
-        lorebook: &Lorebook,
-        triggered_ids: &[String],
-        already_active: &[String],
+        books: &LorebookSet,
+        triggered_ids: &[(BookId, String)],
+        already_active: &[(BookId, String)],
         host: &mut WeaverHost,
         registry: &Registry,
         state: &ActivationState,
     ) -> Vec<ActivationResult> {
         let mut results = Vec::new();
 
-        for id in triggered_ids {
-            // Skip already-active entries UNLESS they are sticky
-            // (triggers can refresh sticky entries)
-            if already_active.contains(id) && state.is_sticky(id).is_none() {
+        for (book, id) in triggered_ids {
+            // Skip already-active entries UNLESS they are sticky.
+            let key = (*book, id.clone());
+            if already_active.contains(&key) && state.is_sticky(id).is_none() {
                 continue;
             }
 
+            let Some(lorebook) = books.get(*book) else {
+                continue;
+            };
             if let Some(entry) = lorebook.get_entry(id) {
                 let meta = &entry.meta;
-
                 if !meta.enabled {
                     continue;
                 }
-
                 if state.is_on_cooldown(&meta.id, meta.cooldown) {
                     continue;
                 }
-
                 if check_condition(&entry.condition, host, registry) {
                     results.push(ActivationResult {
+                        book: *book,
                         entry_id: meta.id.clone(),
                         reason: ActivationReason::Triggered,
                         priority: meta.priority,

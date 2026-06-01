@@ -84,11 +84,11 @@
 //! );
 //! ```
 
+use crate::{BookId, ChatMessage};
 use crate::activation::{ActivationResult, ActivationState};
 use crate::assembler::AssembledBlock;
 use crate::entry::Entry;
 use crate::lorebook::Lorebook;
-use crate::ChatMessage;
 
 // ── Errors ──────────────────────────────────────────────────────────────
 
@@ -205,7 +205,7 @@ pub struct TurnAdvanceCtx<'a> {
 /// the engine filters those through cooldown and condition checks. Hooks may
 /// mutate `triggered_ids` to add, remove, or reorder.
 pub struct TriggerCtx<'a> {
-    pub triggered_ids: &'a mut Vec<String>,
+    pub triggered_ids: &'a mut Vec<(BookId, String)>,
     pub pass_number: usize,
 }
 
@@ -373,8 +373,8 @@ impl LifecyclePlugin for FnLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn fn_lifecycle_invokes_set_hook() {

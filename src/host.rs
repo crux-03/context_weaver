@@ -63,7 +63,7 @@ pub struct WeaverHost {
     max_recursion_depth: usize,
 
     /// Set of entry IDs that are currently active (populated before evaluation).
-    active_entries: HashSet<String>,
+    active_entries: HashSet<(BookId, String)>,
 
     /// The entry currently being evaluated (for diagnostics).
     current_entry: Option<String>,
@@ -75,7 +75,7 @@ pub struct WeaverHost {
     /// Entry IDs activated via `<trigger>` during the current evaluation
     /// pass. The engine drains this after evaluation to feed the next
     /// activation pass.
-    triggered_entries: Vec<String>,
+    triggered_entries: Vec<(BookId, String)>,
 
     /// Strategy for mapping a document id to its template. Defaults to a
     /// direct lookup; a host may override it via `set_id_resolver`.
@@ -135,11 +135,10 @@ impl WeaverHost {
     ///
     /// Also populates the `_active` namespace so that the `is_active`
     /// command can check entry status from within templates.
-    pub fn set_active_entries(&mut self, ids: HashSet<String>) {
-        // Clear previous _active namespace
+    pub fn set_active_entries(&mut self, ids: HashSet<(BookId, String)>) {
         self.variables.remove("_active");
         let mut active_ns = HashMap::new();
-        for id in &ids {
+        for (_book, id) in &ids {
             active_ns.insert(id.clone(), Value::Bool(true));
         }
         self.variables.insert("_active".to_string(), active_ns);
@@ -148,7 +147,7 @@ impl WeaverHost {
 
     /// Check if an entry is currently active.
     pub fn is_entry_active(&self, id: &str) -> bool {
-        self.active_entries.contains(id)
+        self.active_entries.iter().any(|(_, eid)| eid == id)
     }
 
     // ── Entry template management ───────────────────────────────────
@@ -174,7 +173,7 @@ impl WeaverHost {
     /// Called by the engine after an evaluation pass. The returned IDs
     /// become candidates for the next activation pass, subject to
     /// cooldown, budget, and other constraints.
-    pub fn drain_triggered_entries(&mut self) -> Vec<String> {
+    pub fn drain_triggered_entries(&mut self) -> Vec<(BookId, String)> {
         std::mem::take(&mut self.triggered_entries)
     }
 
@@ -277,16 +276,22 @@ impl EvalContext for WeaverHost {
     }
 
     fn fire_trigger(&mut self, entry_id: &str, _registry: &Registry) -> Result<String, EvalError> {
-        // In ContextWeaver, triggers don't produce output. They record
-        // the entry ID for the engine to pick up after evaluation and
-        // feed into the next activation pass.
-        if !self.active_entries.contains(entry_id)
-            && !self.triggered_entries.contains(&entry_id.to_string())
-        {
-            self.triggered_entries.push(entry_id.to_string());
+        // Triggers resolve like document refs: the calling entry's book
+        // first, then the others. If the id resolves nowhere, fall back to
+        // the local book (or book 0) and let filter_triggered drop it.
+        let origin = self.eval_stack.last().map(|(book, _)| *book);
+        let book = self
+            .resolver
+            .resolve(entry_id, origin, &self.book_templates)
+            .map(|r| r.book)
+            .or(origin)
+            .unwrap_or(BookId(0));
+
+        let key = (book, entry_id.to_string());
+        if !self.active_entries.contains(&key) && !self.triggered_entries.contains(&key) {
+            self.triggered_entries.push(key);
         }
 
-        // Triggers produce no output
         Ok(String::new())
     }
 
@@ -447,8 +452,8 @@ mod tests {
     fn test_active_entries_populate_namespace() {
         let mut host = make_host();
         host.set_active_entries(HashSet::from([
-            "entry_a".to_string(),
-            "entry_b".to_string(),
+            (BookId(0), "entry_a".to_string()),
+            (BookId(0), "entry_b".to_string()),
         ]));
 
         // Should be readable via _active namespace
@@ -479,7 +484,13 @@ mod tests {
         host.fire_trigger("entry_b", &registry).unwrap();
 
         let triggered = host.drain_triggered_entries();
-        assert_eq!(triggered, vec!["entry_a", "entry_b"]);
+        assert_eq!(
+            triggered,
+            vec![
+                (BookId(0), "entry_a".to_string()),
+                (BookId(0), "entry_b".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -491,13 +502,13 @@ mod tests {
         host.fire_trigger("entry_a", &registry).unwrap();
 
         let triggered = host.drain_triggered_entries();
-        assert_eq!(triggered, vec!["entry_a"]);
+        assert_eq!(triggered, vec![(BookId(0), "entry_a".to_string())]);
     }
 
     #[test]
     fn test_trigger_skips_already_active() {
         let mut host = make_host();
-        host.set_active_entries(HashSet::from(["entry_a".to_string()]));
+        host.set_active_entries(HashSet::from([(BookId(0), "entry_a".to_string())]));
         let registry = Registry::new();
 
         host.fire_trigger("entry_a", &registry).unwrap();

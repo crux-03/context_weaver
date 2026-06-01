@@ -92,7 +92,7 @@ pub use lifecycle::{
     FnLifecycle, HookError, LifecyclePlugin, PostActivationCtx, PostAssembleCtx, PostEvaluateCtx,
     PreActivationCtx, PreEvaluateCtx, TriggerCtx, TurnAdvanceCtx,
 };
-pub use lorebook::{BookId, Lorebook, LorebookConfig};
+pub use lorebook::{BookId, Lorebook, LorebookConfig, LorebookSet};
 pub use plugin::Plugin;
 pub use resolver::{BookTemplates, DefaultIdResolver, IdResolver, ResolvedRef};
 
@@ -109,7 +109,7 @@ use weaver_lang::{CompiledTemplate, EvalContext, EvalError, Registry, Value};
 /// Owns a [`Lorebook`], manages the [`Registry`] and [`WeaverHost`],
 /// and orchestrates the activation → evaluation → assembly pipeline.
 pub struct ContextWeaver {
-    lorebook: Lorebook,
+    books: LorebookSet,
     registry: Registry,
     host: WeaverHost,
     activation_state: ActivationState,
@@ -198,7 +198,7 @@ impl ContextWeaver {
         host.set_max_recursion_depth(EngineConfig::default().max_recursion_depth);
 
         Self {
-            lorebook,
+            books: LorebookSet::single(lorebook),
             registry,
             host,
             activation_state: ActivationState::new(),
@@ -240,6 +240,13 @@ impl ContextWeaver {
     /// character attributes, user preferences, world state, etc.
     pub fn set_variable(&mut self, scope: &str, name: &str, value: impl Into<Value>) {
         self.host.set_host_variable(scope, name, value.into());
+    }
+
+    /// Add a lorebook to the set, returning its [`BookId`]. Books are
+    /// evaluated together; ids reference across books local-first, then fall
+    /// back to the other books in registration order.
+    pub fn add_lorebook(&mut self, book: Lorebook) -> BookId {
+        self.books.add(book)
     }
 
     /// Register a plugin, adding its processors and commands to the registry.
@@ -324,12 +331,12 @@ impl ContextWeaver {
         }
 
         // ── Prepare host for evaluation ─────────────────────────────
-        let entry_templates = self.build_book_templates();
-        self.host.set_entry_templates(entry_templates);
+        let book_templates = self.build_book_templates();
+        self.host.set_book_templates(book_templates);
 
         // ── Phase 1: Activation scan ────────────────────────────────
         let mut results = ActivationEngine::scan(
-            &self.lorebook,
+            self.books.primary(),
             messages,
             &mut self.host,
             &self.registry,
@@ -339,7 +346,7 @@ impl ContextWeaver {
         // ── Lifecycle: post_activation ──────────────────────────────
         {
             let lifecycle_plugins = &mut self.lifecycle_plugins;
-            let lorebook = &self.lorebook;
+            let lorebook = self.books.primary();
             for plugin in lifecycle_plugins {
                 let plugin_name = plugin.name().to_string();
                 let mut ctx = PostActivationCtx {
@@ -362,7 +369,10 @@ impl ContextWeaver {
             results.truncate(self.config.max_active_entries);
         }
 
-        let mut active_ids: Vec<String> = results.iter().map(|r| r.entry_id.clone()).collect();
+        let mut active_ids: Vec<(BookId, String)> = results
+            .iter()
+            .map(|r| (r.book, r.entry_id.clone()))
+            .collect();
 
         // Tell the host which entries are active (for trigger dedup and
         // the is_active command via the _active namespace)
@@ -381,11 +391,11 @@ impl ContextWeaver {
         //   2. Drain triggered IDs from host
         //   3. Filter through cooldown/conditions
         //   4. Add newly activated entries to the list, repeat
-        let mut evaluated_cache: HashMap<String, EvaluatedEntry> = HashMap::new();
+        let mut evaluated_cache: HashMap<(BookId, String), EvaluatedEntry> = HashMap::new();
 
         // Evaluate the initial batch and cache results
-        for entry in self.evaluate_entries(&active_ids)? {
-            evaluated_cache.insert(entry.id.clone(), entry);
+        for (key, entry) in self.evaluate_entries(&active_ids)? {
+            evaluated_cache.insert(key, entry);
         }
 
         for pass_number in 0..self.config.max_trigger_passes {
@@ -413,7 +423,7 @@ impl ContextWeaver {
 
             // Filter through activation rules
             let new_results = ActivationEngine::filter_triggered(
-                &self.lorebook,
+                &self.books,
                 &triggered,
                 &active_ids,
                 &mut self.host,
@@ -428,10 +438,10 @@ impl ContextWeaver {
             // Collect truly new entry IDs (skip entries already in
             // active_ids — they may be sticky refreshes that don't need
             // re-evaluation or duplicate list entries)
-            let new_ids: Vec<String> = new_results
+            let new_ids: Vec<(BookId, String)> = new_results
                 .iter()
-                .map(|r| r.entry_id.clone())
-                .filter(|id| !active_ids.contains(id))
+                .map(|r| (r.book, r.entry_id.clone()))
+                .filter(|key| !active_ids.contains(key))
                 .collect();
 
             for id in &new_ids {
@@ -445,8 +455,8 @@ impl ContextWeaver {
 
             // Evaluate ONLY the truly new entries (not sticky refreshes)
             if !new_ids.is_empty() {
-                for entry in self.evaluate_entries(&new_ids)? {
-                    evaluated_cache.insert(entry.id.clone(), entry);
+                for (key, entry) in self.evaluate_entries(&new_ids)? {
+                    evaluated_cache.insert(key, entry);
                 }
             }
 
@@ -459,7 +469,7 @@ impl ContextWeaver {
         // ── Phase 3: Collect evaluated entries in activation order ───
         let evaluated: Vec<EvaluatedEntry> = active_ids
             .iter()
-            .filter_map(|id| evaluated_cache.remove(id))
+            .filter_map(|key| evaluated_cache.remove(key))
             .collect();
 
         // ── Phase 4: Record activations ─────────────────────────────
@@ -477,7 +487,11 @@ impl ContextWeaver {
             if matches!(result.reason, ActivationReason::Sticky { .. }) {
                 continue;
             }
-            if let Some(entry) = self.lorebook.get_entry(&result.entry_id) {
+            if let Some(entry) = self
+                .books
+                .get(result.book)
+                .and_then(|b| b.get_entry(&result.entry_id))
+            {
                 self.activation_state
                     .record_activation(&result.entry_id, entry.meta.sticky_turns);
             }
@@ -486,7 +500,7 @@ impl ContextWeaver {
         // ── Phase 5: Assemble ───────────────────────────────────────
         let mut blocks = ContextAssembler::assemble(
             evaluated,
-            &self.lorebook.config,
+            &self.books.primary().config,
             &*self.tokenizer,
             &self.available_slots,
         );
@@ -494,7 +508,7 @@ impl ContextWeaver {
         // ── Lifecycle: post_assemble ────────────────────────────────
         {
             let lifecycle_plugins = &mut self.lifecycle_plugins;
-            let lorebook = &self.lorebook;
+            let lorebook = self.books.primary();
             for plugin in lifecycle_plugins {
                 let plugin_name = plugin.name().to_string();
                 let mut ctx = PostAssembleCtx {
@@ -514,29 +528,37 @@ impl ContextWeaver {
         Ok(blocks)
     }
 
-    /// Build the per-book template store for the host (single book for now).
-    fn build_book_templates(&self) -> HashMap<String, Arc<CompiledTemplate>> {
-        self.lorebook
-            .entries_in_order()
-            .map(|e| (e.meta.id.clone(), e.compiled.clone()))
-            .collect()
+    /// Build the per-book template store for the host, one partition per book.
+    fn build_book_templates(&self) -> BookTemplates {
+        let mut books = BookTemplates::new();
+        for (_id, book) in self.books.iter() {
+            let templates: HashMap<String, Arc<CompiledTemplate>> = book
+                .entries_in_order()
+                .map(|e| (e.meta.id.clone(), e.compiled.clone()))
+                .collect();
+            books.push(templates);
+        }
+        books
     }
 
     /// Evaluate all active entries and collect their output.
     fn evaluate_entries(
         &mut self,
-        entry_ids: &[String],
-    ) -> Result<Vec<EvaluatedEntry>, ContextWeaverError> {
+        keys: &[(BookId, String)],
+    ) -> Result<Vec<((BookId, String), EvaluatedEntry)>, ContextWeaverError> {
         let mut results = Vec::new();
 
-        for id in entry_ids {
-            if let Some(entry) = self.lorebook.get_entry(id).cloned() {
-                if let Some(content) = self.evaluate_single_entry(&entry)? {
-                    results.push(EvaluatedEntry {
-                        id: id.clone(),
-                        meta: entry.meta.clone(),
-                        content,
-                    });
+        for (book, id) in keys {
+            if let Some(entry) = self.books.get(*book).and_then(|b| b.get_entry(id)).cloned() {
+                if let Some(content) = self.evaluate_single_entry(*book, &entry)? {
+                    results.push((
+                        (*book, id.clone()),
+                        EvaluatedEntry {
+                            id: id.clone(),
+                            meta: entry.meta.clone(),
+                            content,
+                        },
+                    ));
                 }
             }
         }
@@ -548,6 +570,7 @@ impl ContextWeaver {
     /// Returns `Ok(None)` if a `pre_evaluate` hook set `skip = true`.
     fn evaluate_single_entry(
         &mut self,
+        book: BookId,
         entry: &Entry,
     ) -> Result<Option<String>, ContextWeaverError> {
         // ── Lifecycle: pre_evaluate ─────────────────────────────────
@@ -571,7 +594,7 @@ impl ContextWeaver {
         }
 
         // ── Evaluate ────────────────────────────────────────────────
-        self.host.begin_entry(BookId(0), &entry.meta.id);
+        self.host.begin_entry(book, &entry.meta.id);
 
         let opts = weaver_lang::EvalOptions::new()
             .max_node_evaluations(50_000)
