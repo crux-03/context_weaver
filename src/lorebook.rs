@@ -19,12 +19,56 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::ContextWeaverError;
 use crate::assembler::Slot;
 use crate::entry::Entry;
 use crate::host::NamespaceConfig;
-use crate::ContextWeaverError;
 
 // ── Lorebook ────────────────────────────────────────────────────────────
+
+/// Stable handle identifying a lorebook within a set. Assigned by
+/// registration order (the first book added is `BookId(0)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BookId(pub usize);
+
+/// An ordered collection of lorebooks evaluated together.
+///
+/// A set always contains at least one book — the *primary* book at
+/// `BookId(0)`. Additional books are appended via [`add`](LorebookSet::add)
+/// and assigned sequential ids. Iteration order equals id order, which is
+/// also the order [`BookTemplates`](crate::resolver::BookTemplates) uses for
+/// the global-fallback scan — keeping the two id spaces aligned.
+pub struct LorebookSet {
+    books: Vec<Lorebook>,
+}
+
+impl LorebookSet {
+    /// Create a set containing a single primary book.
+    pub fn single(book: Lorebook) -> Self {
+        Self { books: vec![book] }
+    }
+
+    pub fn get(&self, id: BookId) -> Option<&Lorebook> {
+        self.books.get(id.0)
+    }
+
+    /// Append a book, returning its assigned [`BookId`].
+    pub fn add(&mut self, book: Lorebook) -> BookId {
+        let id = BookId(self.books.len());
+        self.books.push(book);
+        id
+    }
+
+    /// The primary book (`BookId(0)`). Always present.
+    pub fn primary(&self) -> &Lorebook {
+        &self.books[0]
+    }
+
+    /// Iterate books with their ids, in registration order.
+    pub fn iter(&self) -> impl Iterator<Item = (BookId, &Lorebook)> {
+        self.books.iter().enumerate().map(|(i, b)| (BookId(i), b))
+    }
+}
 
 pub struct Lorebook {
     pub config: LorebookConfig,
@@ -208,7 +252,7 @@ impl Default for LorebookConfig {
         Self {
             name: String::new(),
             description: String::new(),
-            namespaces: default_namespaces(),
+            namespaces: HashMap::new(),
             default_scan_depth: default_scan_depth(),
             default_priority: default_priority(),
             default_slot: Slot::default(),
@@ -220,50 +264,19 @@ impl Default for LorebookConfig {
     }
 }
 
-/// Default namespace configuration: common scopes for LLM RP apps.
-fn default_namespaces() -> HashMap<String, NamespaceConfig> {
-    use crate::host::NamespaceAccess;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut ns = HashMap::new();
+    #[test]
+    fn test_set_assigns_sequential_ids() {
+        let mut set = LorebookSet::single(Lorebook::new());
+        let b1 = set.add(Lorebook::new());
+        let b2 = set.add(Lorebook::new());
+        assert_eq!(b1, BookId(1));
+        assert_eq!(b2, BookId(2));
 
-    // Host-provided, read-only to templates
-    ns.insert(
-        "char".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadOnly,
-            description: "Active character data (name, class, traits)".into(),
-        },
-    );
-    ns.insert(
-        "user".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadOnly,
-            description: "User/player data (name, persona, preferences)".into(),
-        },
-    );
-    ns.insert(
-        "chat".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadOnly,
-            description: "Conversation metadata (turn count, last message)".into(),
-        },
-    );
-
-    // Writable by templates
-    ns.insert(
-        "state".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadWrite,
-            description: "Persistent lorebook state (survives across turns)".into(),
-        },
-    );
-    ns.insert(
-        "local".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadWrite,
-            description: "Temporary variables scoped to a single evaluation pass".into(),
-        },
-    );
-
-    ns
+        let ids: Vec<BookId> = set.iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![BookId(0), BookId(1), BookId(2)]);
+    }
 }

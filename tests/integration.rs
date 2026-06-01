@@ -19,7 +19,9 @@
 //! visits a merchant (triggering a quest), fights monsters, levels up,
 //! checks inventory, and tests cooldown/sticky mechanics.
 
-use context_weaver::{AssembledBlock, ChatMessage, ContextWeaver, Entry, Lorebook, Slot};
+use context_weaver::{
+    AssembledBlock, ChatMessage, ContextWeaver, Entry, Lorebook, NamespaceAccess, Slot,
+};
 use weaver_lang::Value;
 
 // ── Entry sources ──────────────────────────────────────────────────────
@@ -256,6 +258,9 @@ fn build_lorebook() -> Lorebook {
 fn build_engine() -> ContextWeaver {
     let book = build_lorebook();
     let mut engine = ContextWeaver::new(book);
+
+    engine.reserve_namespace("char", NamespaceAccess::ReadOnly);
+    engine.reserve_namespace("user", NamespaceAccess::ReadOnly);
 
     // Set up the character and user (read-only namespaces)
     engine.set_variable("char", "name", "Kael");
