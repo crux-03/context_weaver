@@ -78,6 +78,7 @@ pub mod host;
 pub mod lifecycle;
 pub mod lorebook;
 pub mod plugin;
+pub mod resolver;
 #[cfg(feature = "stdlib")]
 pub mod stdlib;
 
@@ -93,6 +94,7 @@ pub use lifecycle::{
 };
 pub use lorebook::{Lorebook, LorebookConfig};
 pub use plugin::Plugin;
+pub use resolver::{DefaultIdResolver, IdResolver};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -607,6 +609,14 @@ impl ContextWeaver {
         }
 
         Ok(Some(content))
+    }
+
+    /// Install a custom [`IdResolver`] for document id resolution.
+    ///
+    /// By default ids resolve by direct lookup. A custom resolver can
+    /// override this — e.g. to resolve ids across multiple active lorebooks.
+    pub fn set_id_resolver(&mut self, resolver: Box<dyn IdResolver>) {
+        self.host.set_id_resolver(resolver);
     }
 }
 

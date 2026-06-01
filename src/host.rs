@@ -15,6 +15,7 @@ use weaver_lang::Value;
 use weaver_lang::{CompiledTemplate, EvalContext, EvalError, EvalErrorKind, Registry};
 
 use crate::lorebook::LorebookConfig;
+use crate::resolver::{DefaultIdResolver, IdResolver};
 
 // ── Namespace access control ────────────────────────────────────────────
 
@@ -75,6 +76,10 @@ pub struct WeaverHost {
     /// pass. The engine drains this after evaluation to feed the next
     /// activation pass.
     triggered_entries: Vec<String>,
+
+    /// Strategy for mapping a document id to its template. Defaults to a
+    /// direct lookup; a host may override it via `set_id_resolver`.
+    resolver: Box<dyn IdResolver>,
 }
 
 impl WeaverHost {
@@ -96,6 +101,7 @@ impl WeaverHost {
             current_entry: None,
             entry_templates: HashMap::new(),
             triggered_entries: Vec::new(),
+            resolver: Box::new(DefaultIdResolver),
         }
     }
 
@@ -209,6 +215,13 @@ impl WeaverHost {
     pub fn set_max_recursion_depth(&mut self, depth: usize) {
         self.max_recursion_depth = depth;
     }
+
+    /// Install a custom [`IdResolver`], replacing the default direct lookup.
+    ///
+    /// Affects every `[[id]]` document reference resolved after this call.
+    pub fn set_id_resolver(&mut self, resolver: Box<dyn IdResolver>) {
+        self.resolver = resolver;
+    }
 }
 
 // ── EvalContext implementation ───────────────────────────────────────────
@@ -300,8 +313,8 @@ impl EvalContext for WeaverHost {
 
         // ── Look up and evaluate ──────────────────────────────────
         let template = self
-            .entry_templates
-            .get(document_id)
+            .resolver
+            .resolve(document_id, &self.entry_templates)
             .ok_or_else(|| {
                 EvalError::new(
                     EvalErrorKind::DocumentNotFound,
@@ -571,5 +584,29 @@ mod tests {
 
         let result = host.resolve_document("doc_a", &registry).unwrap();
         assert_eq!(result, "Hello, world!");
+    }
+
+    #[test]
+    fn test_custom_id_resolver_overrides_lookup() {
+        struct AliasResolver;
+        impl crate::resolver::IdResolver for AliasResolver {
+            fn resolve<'a>(
+                &self,
+                _id: &str,
+                templates: &'a HashMap<String, Arc<CompiledTemplate>>,
+            ) -> Option<&'a Arc<CompiledTemplate>> {
+                // Redirect every id to the canonical entry.
+                templates.get("canonical")
+            }
+        }
+
+        let mut host = make_host();
+        host.set_id_resolver(Box::new(AliasResolver));
+
+        let template = Arc::new(CompiledTemplate::compile("canonical content").unwrap());
+        host.set_entry_templates(HashMap::from([("canonical".to_string(), template)]));
+
+        let result = host.resolve_document("anything", &Registry::new()).unwrap();
+        assert_eq!(result, "canonical content");
     }
 }
