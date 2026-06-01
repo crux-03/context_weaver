@@ -38,8 +38,8 @@ use crate::lorebook::LorebookConfig;
 /// Slots describe functional depth rather than structural position.
 /// The host application's template declares which slots are available
 /// and where each one sits in the final prompt. Standard slot names
-/// form a gradient from deep background (`Preamble`) to immediate
-/// foreground (`Immediate`/`Aftermath`).
+/// form a gradient from deep background (`Prelude`) to post-chat
+/// follow-up (`Coda`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Slot {
@@ -47,14 +47,15 @@ pub enum Slot {
     Prelude,
     /// Core background. Setting lore, character backstory, stable world state.
     Preamble,
-    /// Situational context. Scene descriptions, current location, active relationships.
+    /// Supporting material. Style guides, secondary character info, historical events.
     #[default]
     Backdrop,
-    /// Supporting material. Style guides, secondary character info, historical events.
+    /// Situational context. Scene descriptions, current location, active relationships.
     Setting,
-    /// Sets the mode for upcoming content. "You are in combat", "this scene is quiet".
+    /// High-visibility content near the chat. Active effects, ongoing conditions,
+    /// urgent reminders.
     Foreground,
-    /// Instructions and constraints. Behavior rules, tone directives, quest objectives.
+    /// After the chat messages. Summaries, narrator notes, follow-up context.
     Coda,
     /// Injected N messages from the end of the chat history.
     /// Handled separately from slot resolution during final prompt construction.
@@ -398,11 +399,7 @@ mod tests {
     fn test_slot_resolution_fallback() {
         let available = HashSet::from([Slot::Backdrop]);
         assert_eq!(
-            resolve_slot(
-                &Slot::Coda,
-                &[Slot::Backdrop, Slot::Preamble],
-                &available,
-            ),
+            resolve_slot(&Slot::Coda, &[Slot::Backdrop, Slot::Preamble], &available,),
             Some(Slot::Backdrop)
         );
     }
@@ -427,21 +424,11 @@ mod tests {
 
     #[test]
     fn test_slot_ordering() {
-        let mut slots = vec![
-            Slot::Setting,
-            Slot::Preamble,
-            Slot::Prelude,
-            Slot::Backdrop,
-        ];
+        let mut slots = vec![Slot::Setting, Slot::Preamble, Slot::Prelude, Slot::Backdrop];
         slots.sort();
         assert_eq!(
             slots,
-            vec![
-                Slot::Prelude,
-                Slot::Preamble,
-                Slot::Backdrop,
-                Slot::Setting
-            ]
+            vec![Slot::Prelude, Slot::Preamble, Slot::Backdrop, Slot::Setting]
         );
     }
 
