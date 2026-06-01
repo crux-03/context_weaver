@@ -252,7 +252,7 @@ impl Default for LorebookConfig {
         Self {
             name: String::new(),
             description: String::new(),
-            namespaces: default_namespaces(),
+            namespaces: HashMap::new(),
             default_scan_depth: default_scan_depth(),
             default_priority: default_priority(),
             default_slot: Slot::default(),
@@ -262,54 +262,6 @@ impl Default for LorebookConfig {
             extensions: HashMap::new(),
         }
     }
-}
-
-/// Default namespace configuration: common scopes for LLM RP apps.
-fn default_namespaces() -> HashMap<String, NamespaceConfig> {
-    use crate::host::NamespaceAccess;
-
-    let mut ns = HashMap::new();
-
-    // Host-provided, read-only to templates
-    ns.insert(
-        "char".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadOnly,
-            description: "Active character data (name, class, traits)".into(),
-        },
-    );
-    ns.insert(
-        "user".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadOnly,
-            description: "User/player data (name, persona, preferences)".into(),
-        },
-    );
-    ns.insert(
-        "chat".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadOnly,
-            description: "Conversation metadata (turn count, last message)".into(),
-        },
-    );
-
-    // Writable by templates
-    ns.insert(
-        "state".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadWrite,
-            description: "Persistent lorebook state (survives across turns)".into(),
-        },
-    );
-    ns.insert(
-        "local".into(),
-        NamespaceConfig {
-            access: NamespaceAccess::ReadWrite,
-            description: "Temporary variables scoped to a single evaluation pass".into(),
-        },
-    );
-
-    ns
 }
 
 #[cfg(test)]

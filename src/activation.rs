@@ -140,6 +140,29 @@ impl ActivationState {
 pub struct ActivationEngine;
 
 impl ActivationEngine {
+    /// Scan every book in the set against its own state, unioning results.
+    /// No cross-book dedup: an id present in two books activates in both.
+    pub fn scan(
+        books: &LorebookSet,
+        messages: &[ChatMessage],
+        host: &mut WeaverHost,
+        registry: &Registry,
+        states: &[ActivationState],
+    ) -> Vec<ActivationResult> {
+        let mut all = Vec::new();
+        for (book_id, lorebook) in books.iter() {
+            let Some(state) = states.get(book_id.0) else {
+                continue;
+            };
+            all.extend(Self::scan_book(
+                lorebook, book_id, messages, host, registry, state,
+            ));
+        }
+        // Global priority order; stable sort preserves per-book order within ties.
+        all.sort_by(|a, b| b.priority.cmp(&a.priority));
+        all
+    }
+
     /// Scan chat messages and determine which entries should activate.
     ///
     /// This is the main entry point for Tier 1 activation. It handles:
@@ -155,8 +178,9 @@ impl ActivationEngine {
     /// re-match, they are carried forward with their existing countdown.
     ///
     /// Returns entry IDs in priority order (highest first).
-    pub fn scan(
+    pub fn scan_book(
         lorebook: &Lorebook,
+        book_id: BookId,
         messages: &[ChatMessage],
         host: &mut WeaverHost,
         registry: &Registry,
@@ -195,7 +219,7 @@ impl ActivationEngine {
                     seen.insert(meta.id.clone());
                     sticky_carry.remove(&meta.id);
                     activated.push(ActivationResult {
-                        book: BookId(0),
+                        book: book_id,
                         entry_id: meta.id.clone(),
                         reason: ActivationReason::Constant,
                         priority: meta.priority,
@@ -246,7 +270,7 @@ impl ActivationEngine {
                     seen.insert(meta.id.clone());
                     sticky_carry.remove(&meta.id);
                     activated.push(ActivationResult {
-                        book: BookId(0),
+                        book: book_id,
                         entry_id: meta.id.clone(),
                         reason,
                         priority: meta.priority,
@@ -259,7 +283,7 @@ impl ActivationEngine {
         for (id, (remaining, priority)) in sticky_carry {
             if !seen.contains(&id) {
                 activated.push(ActivationResult {
-                    book: BookId(0),
+                    book: book_id,
                     entry_id: id,
                     reason: ActivationReason::Sticky {
                         remaining_turns: remaining,
@@ -285,17 +309,18 @@ impl ActivationEngine {
         already_active: &[(BookId, String)],
         host: &mut WeaverHost,
         registry: &Registry,
-        state: &ActivationState,
+        states: &[ActivationState],
     ) -> Vec<ActivationResult> {
         let mut results = Vec::new();
 
         for (book, id) in triggered_ids {
-            // Skip already-active entries UNLESS they are sticky.
+            let Some(state) = states.get(book.0) else {
+                continue;
+            };
             let key = (*book, id.clone());
             if already_active.contains(&key) && state.is_sticky(id).is_none() {
                 continue;
             }
-
             let Some(lorebook) = books.get(*book) else {
                 continue;
             };
@@ -487,6 +512,7 @@ mod tests {
     #[test]
     fn test_condition_none_is_true() {
         let mut host = crate::host::WeaverHost::from_lorebook_config(
+            BookId(0),
             &crate::lorebook::LorebookConfig::default(),
         );
         let registry = Registry::new();
@@ -496,8 +522,10 @@ mod tests {
     #[test]
     fn test_condition_true_expression() {
         let mut host = crate::host::WeaverHost::from_lorebook_config(
+            BookId(0),
             &crate::lorebook::LorebookConfig::default(),
         );
+        host.reserve_namespace("state", crate::host::NamespaceAccess::ReadWrite);
         host.set_host_variable("state", "level", weaver_lang::Value::Number(10.0));
         let registry = Registry::new();
 
@@ -508,6 +536,7 @@ mod tests {
     #[test]
     fn test_condition_false_expression() {
         let mut host = crate::host::WeaverHost::from_lorebook_config(
+            BookId(0),
             &crate::lorebook::LorebookConfig::default(),
         );
         host.set_host_variable("state", "level", weaver_lang::Value::Number(3.0));
@@ -520,6 +549,7 @@ mod tests {
     #[test]
     fn test_condition_error_returns_false() {
         let mut host = crate::host::WeaverHost::from_lorebook_config(
+            BookId(0),
             &crate::lorebook::LorebookConfig::default(),
         );
         let registry = Registry::new();

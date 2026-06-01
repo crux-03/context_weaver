@@ -45,8 +45,13 @@ pub struct NamespaceConfig {
 /// Manages variable storage across namespaces, enforces access control,
 /// and handles trigger/document resolution with cycle detection.
 pub struct WeaverHost {
-    /// Access control rules per namespace.
-    namespace_access: HashMap<String, NamespaceAccess>,
+    /// Host-reserved namespaces: uniform across all books, not declarable
+    /// or overridable by any book. Populated via `reserve_namespace`.
+    reserved_namespaces: HashMap<String, NamespaceAccess>,
+    /// Per-book namespace access from book declarations. A book's
+    /// declaration governs only that book's own access. A scope in neither
+    /// map is invalid.
+    namespace_access: HashMap<String, HashMap<BookId, NamespaceAccess>>,
 
     /// Variable storage: namespace → (name → value).
     variables: HashMap<String, HashMap<String, Value>>,
@@ -84,14 +89,18 @@ pub struct WeaverHost {
 
 impl WeaverHost {
     /// Create a WeaverHost from lorebook configuration.
-    pub fn from_lorebook_config(config: &LorebookConfig) -> Self {
-        let namespace_access: HashMap<String, NamespaceAccess> = config
-            .namespaces
-            .iter()
-            .map(|(k, v)| (k.clone(), v.access))
-            .collect();
+    pub fn from_lorebook_config(book: BookId, config: &LorebookConfig) -> Self {
+        let mut namespace_access: HashMap<String, HashMap<BookId, NamespaceAccess>> =
+            HashMap::new();
+        for (name, cfg) in &config.namespaces {
+            namespace_access
+                .entry(name.clone())
+                .or_default()
+                .insert(book, cfg.access);
+        }
 
         Self {
+            reserved_namespaces: HashMap::new(),
             namespace_access,
             variables: HashMap::new(),
             persistent_state: HashMap::new(),
@@ -102,6 +111,28 @@ impl WeaverHost {
             book_templates: BookTemplates::new(),
             triggered_entries: Vec::new(),
             resolver: Box::new(DefaultIdResolver),
+        }
+    }
+
+    /// Reserve a namespace with fixed access, uniform across all books.
+    /// Reserved namespaces win over any book declaration and cannot be
+    /// changed by a book.
+    pub fn reserve_namespace(&mut self, name: impl Into<String>, access: NamespaceAccess) {
+        self.reserved_namespaces.insert(name.into(), access);
+    }
+
+    /// Record an additional book's namespace declarations. Each governs only
+    /// that book; declarations of reserved names are recorded but never win.
+    pub fn add_book_namespaces(
+        &mut self,
+        book: BookId,
+        namespaces: &HashMap<String, NamespaceConfig>,
+    ) {
+        for (name, cfg) in namespaces {
+            self.namespace_access
+                .entry(name.clone())
+                .or_default()
+                .insert(book, cfg.access);
         }
     }
 
@@ -136,12 +167,6 @@ impl WeaverHost {
     /// Also populates the `_active` namespace so that the `is_active`
     /// command can check entry status from within templates.
     pub fn set_active_entries(&mut self, ids: HashSet<(BookId, String)>) {
-        self.variables.remove("_active");
-        let mut active_ns = HashMap::new();
-        for (_book, id) in &ids {
-            active_ns.insert(id.clone(), Value::Bool(true));
-        }
-        self.variables.insert("_active".to_string(), active_ns);
         self.active_entries = ids;
     }
 
@@ -227,38 +252,72 @@ impl WeaverHost {
     pub fn set_id_resolver(&mut self, resolver: Box<dyn IdResolver>) {
         self.resolver = resolver;
     }
+
+    /// Resolve access for `scope` from `book`'s perspective. Reserved wins
+    /// and is uniform; otherwise the calling book's own declaration. `None`
+    /// means the scope is undeclared — invalid.
+    fn namespace_access_for(&self, scope: &str, book: Option<BookId>) -> Option<NamespaceAccess> {
+        if let Some(access) = self.reserved_namespaces.get(scope) {
+            return Some(*access);
+        }
+        book.and_then(|b| self.namespace_access.get(scope)?.get(&b).copied())
+    }
 }
 
 // ── EvalContext implementation ───────────────────────────────────────────
 
 impl EvalContext for WeaverHost {
     fn resolve_variable(&self, scope: &str, name: &str) -> Result<Option<Value>, EvalError> {
-        // Check variables map
+        // ── Internal pseudo-scopes: answered live, never gated ──────
+        if scope == "_active" {
+            let here = self
+                .eval_stack
+                .last()
+                .map(|(book, _)| self.active_entries.contains(&(*book, name.to_string())))
+                .unwrap_or(false);
+            return Ok(Some(Value::Bool(here)));
+        }
+        if scope == "_active_global" {
+            let anywhere = self.active_entries.iter().any(|(_, id)| id == name);
+            return Ok(Some(Value::Bool(anywhere)));
+        }
+
+        // ── Undeclared scopes are invalid: reads yield nothing ──────
+        let book = self.eval_stack.last().map(|(b, _)| *b);
+        if self.namespace_access_for(scope, book).is_none() {
+            return Ok(None);
+        }
+
+        // ── Stored variables ────────────────────────────────────────
         if let Some(ns) = self.variables.get(scope) {
             if let Some(val) = ns.get(name) {
                 return Ok(Some(val.clone()));
             }
         }
-
-        // For the state namespace, also check persistent state
         if scope == "state" {
             if let Some(val) = self.persistent_state.get(name) {
                 return Ok(Some(val.clone()));
             }
         }
-
         Ok(None)
     }
 
     fn set_variable(&mut self, scope: &str, name: &str, value: Value) -> Result<(), EvalError> {
-        // Check access control
-        if let Some(access) = self.namespace_access.get(scope) {
-            if *access == NamespaceAccess::ReadOnly {
+        let book = self.eval_stack.last().map(|(b, _)| *b);
+        match self.namespace_access_for(scope, book) {
+            None => {
+                return Err(EvalError::new(
+                    EvalErrorKind::HostError,
+                    format!("namespace '{scope}' is not declared (cannot set {scope}:{name})"),
+                ));
+            }
+            Some(NamespaceAccess::ReadOnly) => {
                 return Err(EvalError::new(
                     EvalErrorKind::HostError,
                     format!("namespace '{scope}' is read-only (cannot set {scope}:{name})"),
                 ));
             }
+            Some(NamespaceAccess::ReadWrite) => {}
         }
 
         // Persist state namespace across sessions
@@ -361,7 +420,11 @@ mod tests {
 
     fn make_host() -> WeaverHost {
         let config = LorebookConfig::default();
-        let mut host = WeaverHost::from_lorebook_config(&config);
+        let mut host = WeaverHost::from_lorebook_config(BookId(0), &config);
+        host.reserve_namespace("char", NamespaceAccess::ReadOnly);
+        host.reserve_namespace("user", NamespaceAccess::ReadOnly);
+        host.reserve_namespace("state", NamespaceAccess::ReadWrite);
+        host.reserve_namespace("local", NamespaceAccess::ReadWrite);
         host.set_host_variable("char", "name", Value::String("Aria".into()));
         host.set_host_variable("char", "class", Value::String("Mage".into()));
         host.set_host_variable("user", "name", Value::String("Player".into()));
@@ -440,10 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_namespace_is_writable() {
+    fn test_undeclared_namespace_is_invalid() {
         let mut host = make_host();
-        let result = host.set_variable("custom", "foo", Value::String("bar".into()));
-        assert!(result.is_ok());
+        // No frame, not reserved, not declared → writes error, reads yield nothing.
+        let write = host.set_variable("custom", "foo", Value::String("bar".into()));
+        assert!(write.is_err());
+        assert_eq!(host.resolve_variable("custom", "foo").unwrap(), None);
     }
 
     // ── Active entry tracking ───────────────────────────────────────
@@ -456,12 +521,19 @@ mod tests {
             (BookId(0), "entry_b".to_string()),
         ]));
 
-        // Should be readable via _active namespace
+        // _active is now book-scoped and answered on-read: it needs a
+        // calling entry to anchor "local" to.
+        host.begin_entry(BookId(0), "caller");
+
+        // Active in the calling book → true.
         let val = host.resolve_variable("_active", "entry_a").unwrap();
         assert_eq!(val, Some(Value::Bool(true)));
 
+        // Not active anywhere → false (no longer None).
         let val = host.resolve_variable("_active", "entry_c").unwrap();
-        assert_eq!(val, None);
+        assert_eq!(val, Some(Value::Bool(false)));
+
+        host.end_entry();
     }
 
     // ── Trigger tests ───────────────────────────────────────────────
@@ -681,5 +753,153 @@ mod tests {
             .unwrap();
         host.end_entry();
         assert_eq!(result, "found in book 0");
+    }
+
+    #[test]
+    fn test_fire_trigger_resolves_to_other_book() {
+        let mut host = make_host();
+        let mut books = BookTemplates::new();
+        books.push(HashMap::new()); // book 0: empty
+        books.push(HashMap::from([(
+            "ambush".to_string(),
+            Arc::new(CompiledTemplate::compile("x").unwrap()),
+        )])); // book 1: has "ambush"
+        host.set_book_templates(books);
+
+        // Firing from book 0 with no local "ambush" → resolves into book 1.
+        host.begin_entry(BookId(0), "starter");
+        host.fire_trigger("ambush", &Registry::new()).unwrap();
+        host.end_entry();
+
+        let triggered = host.drain_triggered_entries();
+        assert_eq!(triggered, vec![(BookId(1), "ambush".to_string())]);
+    }
+
+    #[test]
+    fn test_is_active_local_vs_global() {
+        let mut host = make_host();
+        // "goblin" active in book 1 only; "sys" active in book 0.
+        host.set_active_entries(HashSet::from([
+            (BookId(0), "sys".to_string()),
+            (BookId(1), "goblin".to_string()),
+        ]));
+
+        // Evaluating inside book 0:
+        host.begin_entry(BookId(0), "caller");
+
+        // Strict-local: book 0 has no "goblin" → false.
+        assert_eq!(
+            host.resolve_variable("_active", "goblin").unwrap(),
+            Some(Value::Bool(false))
+        );
+        // Global: "goblin" is active in book 1 → true.
+        assert_eq!(
+            host.resolve_variable("_active_global", "goblin").unwrap(),
+            Some(Value::Bool(true))
+        );
+        // Local hit still works for book 0's own entry.
+        assert_eq!(
+            host.resolve_variable("_active", "sys").unwrap(),
+            Some(Value::Bool(true))
+        );
+
+        host.end_entry();
+    }
+
+    #[test]
+    fn test_is_active_local_outside_any_entry() {
+        let mut host = make_host();
+        host.set_active_entries(HashSet::from([(BookId(0), "sys".to_string())]));
+        // No eval-stack frame → no local book → strict-local is false,
+        // global still sees it.
+        assert_eq!(
+            host.resolve_variable("_active", "sys").unwrap(),
+            Some(Value::Bool(false))
+        );
+        assert_eq!(
+            host.resolve_variable("_active_global", "sys").unwrap(),
+            Some(Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_reserved_overrides_book_declaration() {
+        let mut host = make_host(); // char reserved ReadOnly
+        // A book tries to declare char ReadWrite — recorded but never wins.
+        let mut ns = HashMap::new();
+        ns.insert(
+            "char".to_string(),
+            NamespaceConfig {
+                access: NamespaceAccess::ReadWrite,
+                description: String::new(),
+            },
+        );
+        host.add_book_namespaces(BookId(1), &ns);
+
+        host.begin_entry(BookId(1), "escalator");
+        let result = host.set_variable("char", "name", Value::String("Hax".into()));
+        host.end_entry();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_book_scoped_access_is_per_book() {
+        let mut host = make_host();
+        // Same non-reserved namespace, opposite access per book.
+        let mut a = HashMap::new();
+        a.insert(
+            "lore".to_string(),
+            NamespaceConfig {
+                access: NamespaceAccess::ReadWrite,
+                description: String::new(),
+            },
+        );
+        host.add_book_namespaces(BookId(0), &a);
+        let mut b = HashMap::new();
+        b.insert(
+            "lore".to_string(),
+            NamespaceConfig {
+                access: NamespaceAccess::ReadOnly,
+                description: String::new(),
+            },
+        );
+        host.add_book_namespaces(BookId(1), &b);
+
+        // Book 0 may write; book 1 may not — same shared storage.
+        host.begin_entry(BookId(0), "writer");
+        let w0 = host.set_variable("lore", "x", Value::Number(1.0));
+        host.end_entry();
+        assert!(w0.is_ok());
+
+        host.begin_entry(BookId(1), "reader");
+        let r = host.resolve_variable("lore", "x").unwrap();
+        let w1 = host.set_variable("lore", "x", Value::Number(2.0));
+        host.end_entry();
+        assert_eq!(r, Some(Value::Number(1.0))); // shared storage: sees book 0's write
+        assert!(w1.is_err()); // but read-only for book 1
+    }
+
+    #[test]
+    fn test_undeclared_scope_unreadable_per_book() {
+        let mut host = make_host();
+        let mut a = HashMap::new();
+        a.insert(
+            "lore".to_string(),
+            NamespaceConfig {
+                access: NamespaceAccess::ReadWrite,
+                description: String::new(),
+            },
+        );
+        host.add_book_namespaces(BookId(0), &a);
+
+        // Book 0 declared "lore"; book 1 did not → invalid for book 1.
+        host.begin_entry(BookId(0), "writer");
+        host.set_variable("lore", "x", Value::Number(1.0)).unwrap();
+        host.end_entry();
+
+        host.begin_entry(BookId(1), "outsider");
+        assert_eq!(host.resolve_variable("lore", "x").unwrap(), None);
+        assert!(host.set_variable("lore", "x", Value::Number(2.0)).is_err());
+        host.end_entry();
     }
 }
