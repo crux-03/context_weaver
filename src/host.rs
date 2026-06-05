@@ -220,16 +220,90 @@ impl WeaverHost {
     // ── Persistent state ────────────────────────────────────────────
 
     /// Get the persistent state map (for serialization between sessions).
+    #[deprecated(
+        since = "0.2.1",
+        note = "Superseded by `WeaverHost::export_persistent`"
+    )]
     pub fn persistent_state(&self) -> &HashMap<String, Value> {
         &self.persistent_state
     }
 
     /// Restore persistent state (e.g. loaded from a save file).
+    ///
+    /// Note: this only restores the `state` namespace. For a full snapshot
+    /// covering every writable namespace, prefer
+    /// [`restore_persistent`](Self::restore_persistent).
+    #[deprecated(
+        since = "0.2.1",
+        note = "Superseded by `WeaverHost::restore_persistent`"
+    )]
     pub fn restore_persistent_state(&mut self, state: HashMap<String, Value>) {
         self.persistent_state = state;
         // Mirror into the variables map so templates can access it
         self.variables
             .insert("state".to_string(), self.persistent_state.clone());
+    }
+
+    /// Snapshot every persistable namespace for serialization between
+    /// sessions, as `namespace → (name → value)`.
+    ///
+    /// Includes the `state` namespace plus any other namespace a template
+    /// could have written to — i.e. every scope that is `ReadWrite` for at
+    /// least one book, or reserved `ReadWrite`. Excludes:
+    ///
+    /// - the transient `local` scope (cleared every turn by
+    ///   [`clear_transient`](Self::clear_transient)), and
+    /// - host-provided `ReadOnly` scopes (`char`, `user`, …), which the host
+    ///   re-supplies each session and which must not be clobbered by a stale
+    ///   saved copy.
+    pub fn export_persistent(&self) -> HashMap<String, HashMap<String, Value>> {
+        let mut out: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        for (scope, vars) in &self.variables {
+            if vars.is_empty() || !self.is_scope_persistable(scope) {
+                continue;
+            }
+            out.insert(scope.clone(), vars.clone());
+        }
+        // `state` is also mirrored in `persistent_state`; make sure anything
+        // there is represented even if it never landed in `variables`.
+        if !self.persistent_state.is_empty() {
+            out.entry("state".to_string()).or_default().extend(
+                self.persistent_state
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+        }
+        out
+    }
+
+    /// Restore a full multi-namespace snapshot produced by
+    /// [`export_persistent`](Self::export_persistent).
+    ///
+    /// Each scope's stored variables are replaced wholesale. The `state`
+    /// namespace is additionally mirrored back into `persistent_state` so the
+    /// two stores stay in sync.
+    pub fn restore_persistent(&mut self, snapshot: HashMap<String, HashMap<String, Value>>) {
+        for (scope, vars) in snapshot {
+            if scope == "state" {
+                self.persistent_state = vars.clone();
+            }
+            self.variables.insert(scope, vars);
+        }
+    }
+
+    /// Whether a scope's contents should be persisted: it is writable by some
+    /// book or reserved `ReadWrite` (so a template could have mutated it), and
+    /// it is neither the transient `local` scope nor an internal pseudo-scope.
+    fn is_scope_persistable(&self, scope: &str) -> bool {
+        if scope == "local" || scope.starts_with('_') {
+            return false;
+        }
+        if let Some(access) = self.reserved_namespaces.get(scope) {
+            return *access == NamespaceAccess::ReadWrite;
+        }
+        self.namespace_access
+            .get(scope)
+            .is_some_and(|per_book| per_book.values().any(|a| *a == NamespaceAccess::ReadWrite))
     }
 
     /// Clear temporary (non-persistent) variables. Called between turns.
@@ -465,10 +539,10 @@ mod tests {
         host.set_variable("state", "counter", Value::Number(42.0))
             .unwrap();
 
-        assert_eq!(
-            host.persistent_state().get("counter"),
-            Some(&Value::Number(42.0))
-        );
+        let persistent = host.export_persistent();
+        let state = persistent.get("state").unwrap();
+
+        assert_eq!(state.get("counter"), Some(&Value::Number(42.0)));
     }
 
     #[test]
@@ -479,10 +553,10 @@ mod tests {
         let val = host.resolve_variable("state", "weapon").unwrap();
         assert_eq!(val, Some(Value::String("longbow".into())));
 
-        assert_eq!(
-            host.persistent_state().get("weapon"),
-            Some(&Value::String("longbow".into()))
-        );
+        let persistent = host.export_persistent();
+        let state = persistent.get("state").unwrap();
+
+        assert_eq!(state.get("weapon"), Some(&Value::String("longbow".into())));
     }
 
     #[test]
@@ -901,5 +975,85 @@ mod tests {
         assert_eq!(host.resolve_variable("lore", "x").unwrap(), None);
         assert!(host.set_variable("lore", "x", Value::Number(2.0)).is_err());
         host.end_entry();
+    }
+
+    // ── Persistence ─────────────────────────────────────────────────
+
+    fn writable_lore_ns() -> HashMap<String, NamespaceConfig> {
+        HashMap::from([(
+            "lore".to_string(),
+            NamespaceConfig {
+                access: NamespaceAccess::ReadWrite,
+                description: String::new(),
+            },
+        )])
+    }
+
+    #[test]
+    fn test_export_covers_all_writable_namespaces() {
+        let mut host = make_host();
+        host.add_book_namespaces(BookId(0), &writable_lore_ns());
+
+        host.begin_entry(BookId(0), "writer");
+        host.set_variable("state", "counter", Value::Number(1.0))
+            .unwrap();
+        host.set_variable("lore", "faction", Value::String("Rebels".into()))
+            .unwrap();
+        host.set_variable("local", "scratch", Value::Bool(true))
+            .unwrap();
+        host.end_entry();
+
+        let snap = host.export_persistent();
+
+        // The previously-lost book namespace is now captured...
+        assert_eq!(
+            snap.get("lore").unwrap().get("faction"),
+            Some(&Value::String("Rebels".into()))
+        );
+        // ...alongside state.
+        assert_eq!(
+            snap.get("state").unwrap().get("counter"),
+            Some(&Value::Number(1.0))
+        );
+        // Transient and host-provided read-only scopes are excluded.
+        assert!(!snap.contains_key("local"));
+        assert!(!snap.contains_key("char"));
+        assert!(!snap.contains_key("user"));
+    }
+
+    #[test]
+    fn test_persistent_round_trip_multi_namespace() {
+        let mut host = make_host();
+        host.add_book_namespaces(BookId(0), &writable_lore_ns());
+
+        host.begin_entry(BookId(0), "writer");
+        host.set_variable("state", "hp", Value::Number(7.0))
+            .unwrap();
+        host.set_variable("lore", "faction", Value::String("Rebels".into()))
+            .unwrap();
+        host.end_entry();
+
+        let snap = host.export_persistent();
+
+        // Reload into a fresh host and confirm both namespaces survive.
+        let mut fresh = make_host();
+        fresh.add_book_namespaces(BookId(0), &writable_lore_ns());
+        fresh.restore_persistent(snap);
+
+        fresh.begin_entry(BookId(0), "reader");
+        assert_eq!(
+            fresh.resolve_variable("state", "hp").unwrap(),
+            Some(Value::Number(7.0))
+        );
+        assert_eq!(
+            fresh.resolve_variable("lore", "faction").unwrap(),
+            Some(Value::String("Rebels".into()))
+        );
+        fresh.end_entry();
+
+        let persistent = fresh.export_persistent();
+        let state = persistent.get("state").unwrap();
+        // The state mirror is kept in sync on restore.
+        assert_eq!(state.get("hp"), Some(&Value::Number(7.0)));
     }
 }

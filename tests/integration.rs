@@ -368,7 +368,8 @@ fn test_multi_turn_rpg_session() {
     assert_eq!(forest_block.slot, Slot::Coda);
 
     // state:visited_forest should have been set by forest_desc
-    let state = engine.persistent_state();
+    let persistent = engine.export_persistent();
+    let state = persistent.get("state").unwrap();
     assert_eq!(
         state.get("visited_forest"),
         Some(&Value::Bool(true)),
@@ -416,7 +417,8 @@ fn test_multi_turn_rpg_session() {
     assert_block_absent(&blocks, "forest_desc");
 
     // Quest state should be persisted
-    let state = engine.persistent_state();
+    let persistent = engine.export_persistent();
+    let state = persistent.get("state").unwrap();
     assert_eq!(state.get("quest_started"), Some(&Value::Bool(true)));
     assert_eq!(
         state.get("quest_name"),
@@ -519,7 +521,8 @@ fn test_multi_turn_rpg_session() {
     assert_block_contains(&blocks, "level_up", "advanced abilities");
 
     // world_rules should reflect the new level
-    let state = engine.persistent_state();
+    let persistent = engine.export_persistent();
+    let state = persistent.get("state").unwrap();
     assert_eq!(Some(&Value::Number(3.0)), state.get("level"));
 
     // ═══════════════════════════════════════════════════════════════════
@@ -696,7 +699,8 @@ fn test_multi_turn_rpg_session() {
     // FINAL: Verify accumulated persistent state
     // ═══════════════════════════════════════════════════════════════════
 
-    let state = engine.persistent_state();
+    let persistent = engine.export_persistent();
+    let state = persistent.get("state").unwrap();
 
     assert_eq!(state.get("level"), Some(&Value::Number(3.0)));
     assert_eq!(state.get("gold"), Some(&Value::Number(50.0)));

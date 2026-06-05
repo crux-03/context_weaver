@@ -293,13 +293,45 @@ impl ContextWeaver {
     }
 
     /// Access the host's persistent state (for serialization).
+    ///
+    /// Note: this only covers the `state` namespace. To serialize *all*
+    /// writable context (book-declared scopes, etc.), use
+    /// [`export_persistent`](Self::export_persistent) instead.
+    #[deprecated(
+        since = "0.2.1",
+        note = "Superseded by `ContextWeaver::export_persistent`"
+    )]
     pub fn persistent_state(&self) -> &HashMap<String, Value> {
+        #[allow(deprecated)]
         self.host.persistent_state()
     }
 
     /// Restore persistent state (e.g. from a save file).
+    #[deprecated(
+        since = "0.2.1",
+        note = "Superseded by `ContextWeaver::restore_persistent`"
+    )]
     pub fn restore_persistent_state(&mut self, state: HashMap<String, Value>) {
+        #[allow(deprecated)]
         self.host.restore_persistent_state(state);
+    }
+
+    /// Export a full snapshot of every persistable namespace for
+    /// serialization, as `namespace → (name → value)`.
+    ///
+    /// Unlike [`persistent_state`](Self::persistent_state) — which only
+    /// captured the `state` namespace and dropped everything else — this
+    /// includes every namespace a template could have written to (any scope
+    /// declared or reserved `ReadWrite`), while excluding the transient
+    /// `local` scope and host-provided read-only scopes.
+    pub fn export_persistent(&self) -> HashMap<String, HashMap<String, Value>> {
+        self.host.export_persistent()
+    }
+
+    /// Restore a full multi-namespace snapshot produced by
+    /// [`export_persistent`](Self::export_persistent).
+    pub fn restore_persistent(&mut self, snapshot: HashMap<String, HashMap<String, Value>>) {
+        self.host.restore_persistent(snapshot);
     }
 
     /// Advance the turn counter. Call this once per conversation turn,
