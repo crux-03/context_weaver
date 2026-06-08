@@ -164,15 +164,25 @@ impl WeaverHost {
 
     /// Mark a set of entry IDs as active (called before evaluation).
     ///
-    /// Also populates the `_active` namespace so that the `is_active`
-    /// command can check entry status from within templates.
+    /// The `is_active` / `is_active_global` commands read this set by
+    /// downcasting the evaluation context back to `WeaverHost`.
     pub fn set_active_entries(&mut self, ids: HashSet<(BookId, String)>) {
         self.active_entries = ids;
     }
 
-    /// Check if an entry is currently active.
+    /// Check if an entry is active in *any* book (the global view).
     pub fn is_entry_active(&self, id: &str) -> bool {
         self.active_entries.iter().any(|(_, eid)| eid == id)
+    }
+
+    /// Check if an entry is active in the *local* book — the book of the
+    /// entry currently being evaluated (top of the eval stack). With no
+    /// frame on the stack there is no local book, so this is always false.
+    pub fn is_entry_active_local(&self, id: &str) -> bool {
+        self.eval_stack
+            .last()
+            .map(|(book, _)| self.active_entries.contains(&(*book, id.to_string())))
+            .unwrap_or(false)
     }
 
     // ── Entry template management ───────────────────────────────────
@@ -251,7 +261,7 @@ impl WeaverHost {
     /// could have written to — i.e. every scope that is `ReadWrite` for at
     /// least one book, or reserved `ReadWrite`. Excludes:
     ///
-    /// - the transient `local` scope (cleared every turn by
+    /// - the transient `temp` scope (cleared every turn by
     ///   [`clear_transient`](Self::clear_transient)), and
     /// - host-provided `ReadOnly` scopes (`char`, `user`, …), which the host
     ///   re-supplies each session and which must not be clobbered by a stale
@@ -293,9 +303,12 @@ impl WeaverHost {
 
     /// Whether a scope's contents should be persisted: it is writable by some
     /// book or reserved `ReadWrite` (so a template could have mutated it), and
-    /// it is neither the transient `local` scope nor an internal pseudo-scope.
+    /// it is not the transient `temp` namespace.
+    /// 
+    /// Additionally namespaces that starts with an underscore are considered
+    /// non-persistent scopes by convention.
     fn is_scope_persistable(&self, scope: &str) -> bool {
-        if scope == "local" || scope.starts_with('_') {
+        if scope == "temp" || scope.starts_with('_') {
             return false;
         }
         if let Some(access) = self.reserved_namespaces.get(scope) {
@@ -309,9 +322,8 @@ impl WeaverHost {
     /// Clear temporary (non-persistent) variables. Called between turns.
     pub fn clear_transient(&mut self) {
         // Keep: state, host-provided namespaces
-        // Clear: local, triggered entries, _active
-        self.variables.remove("local");
-        self.variables.remove("_active");
+        // Clear: temp, triggered entries
+        self.variables.remove("temp");
         self.triggered_entries.clear();
     }
 
@@ -342,20 +354,6 @@ impl WeaverHost {
 
 impl EvalContext for WeaverHost {
     fn resolve_variable(&self, scope: &str, name: &str) -> Result<Option<Value>, EvalError> {
-        // ── Internal pseudo-scopes: answered live, never gated ──────
-        if scope == "_active" {
-            let here = self
-                .eval_stack
-                .last()
-                .map(|(book, _)| self.active_entries.contains(&(*book, name.to_string())))
-                .unwrap_or(false);
-            return Ok(Some(Value::Bool(here)));
-        }
-        if scope == "_active_global" {
-            let anywhere = self.active_entries.iter().any(|(_, id)| id == name);
-            return Ok(Some(Value::Bool(anywhere)));
-        }
-
         // ── Undeclared scopes are invalid: reads yield nothing ──────
         let book = self.eval_stack.last().map(|(b, _)| *b);
         if self.namespace_access_for(scope, book).is_none() {
@@ -498,7 +496,7 @@ mod tests {
         host.reserve_namespace("char", NamespaceAccess::ReadOnly);
         host.reserve_namespace("user", NamespaceAccess::ReadOnly);
         host.reserve_namespace("state", NamespaceAccess::ReadWrite);
-        host.reserve_namespace("local", NamespaceAccess::ReadWrite);
+        host.reserve_namespace("temp", NamespaceAccess::ReadWrite);
         host.set_host_variable("char", "name", Value::String("Aria".into()));
         host.set_host_variable("char", "class", Value::String("Mage".into()));
         host.set_host_variable("user", "name", Value::String("Player".into()));
@@ -562,14 +560,14 @@ mod tests {
     #[test]
     fn test_clear_transient_preserves_state() {
         let mut host = make_host();
-        host.set_variable("local", "temp", Value::String("gone".into()))
+        host.set_variable("temp", "test", Value::String("gone".into()))
             .unwrap();
         host.set_variable("state", "kept", Value::Bool(true))
             .unwrap();
 
         host.clear_transient();
 
-        assert_eq!(host.resolve_variable("local", "temp").unwrap(), None);
+        assert_eq!(host.resolve_variable("temp", "test").unwrap(), None);
         assert_eq!(
             host.resolve_variable("state", "kept").unwrap(),
             Some(Value::Bool(true))
@@ -588,24 +586,21 @@ mod tests {
     // ── Active entry tracking ───────────────────────────────────────
 
     #[test]
-    fn test_active_entries_populate_namespace() {
+    fn test_is_entry_active_local() {
         let mut host = make_host();
         host.set_active_entries(HashSet::from([
             (BookId(0), "entry_a".to_string()),
             (BookId(0), "entry_b".to_string()),
         ]));
 
-        // _active is now book-scoped and answered on-read: it needs a
-        // calling entry to anchor "local" to.
+        // is_entry_active_local is book-scoped: it needs a calling entry
+        // to anchor "local" to.
         host.begin_entry(BookId(0), "caller");
 
         // Active in the calling book → true.
-        let val = host.resolve_variable("_active", "entry_a").unwrap();
-        assert_eq!(val, Some(Value::Bool(true)));
-
-        // Not active anywhere → false (no longer None).
-        let val = host.resolve_variable("_active", "entry_c").unwrap();
-        assert_eq!(val, Some(Value::Bool(false)));
+        assert!(host.is_entry_active_local("entry_a"));
+        // Not active anywhere → false.
+        assert!(!host.is_entry_active_local("entry_c"));
 
         host.end_entry();
     }
@@ -862,20 +857,11 @@ mod tests {
         host.begin_entry(BookId(0), "caller");
 
         // Strict-local: book 0 has no "goblin" → false.
-        assert_eq!(
-            host.resolve_variable("_active", "goblin").unwrap(),
-            Some(Value::Bool(false))
-        );
+        assert!(!host.is_entry_active_local("goblin"));
         // Global: "goblin" is active in book 1 → true.
-        assert_eq!(
-            host.resolve_variable("_active_global", "goblin").unwrap(),
-            Some(Value::Bool(true))
-        );
+        assert!(host.is_entry_active("goblin"));
         // Local hit still works for book 0's own entry.
-        assert_eq!(
-            host.resolve_variable("_active", "sys").unwrap(),
-            Some(Value::Bool(true))
-        );
+        assert!(host.is_entry_active_local("sys"));
 
         host.end_entry();
     }
@@ -886,14 +872,8 @@ mod tests {
         host.set_active_entries(HashSet::from([(BookId(0), "sys".to_string())]));
         // No eval-stack frame → no local book → strict-local is false,
         // global still sees it.
-        assert_eq!(
-            host.resolve_variable("_active", "sys").unwrap(),
-            Some(Value::Bool(false))
-        );
-        assert_eq!(
-            host.resolve_variable("_active_global", "sys").unwrap(),
-            Some(Value::Bool(true))
-        );
+        assert!(!host.is_entry_active_local("sys"));
+        assert!(host.is_entry_active("sys"));
     }
 
     #[test]
@@ -999,7 +979,7 @@ mod tests {
             .unwrap();
         host.set_variable("lore", "faction", Value::String("Rebels".into()))
             .unwrap();
-        host.set_variable("local", "scratch", Value::Bool(true))
+        host.set_variable("temp", "scratch", Value::Bool(true))
             .unwrap();
         host.end_entry();
 
@@ -1016,7 +996,7 @@ mod tests {
             Some(&Value::Number(1.0))
         );
         // Transient and host-provided read-only scopes are excluded.
-        assert!(!snap.contains_key("local"));
+        assert!(!snap.contains_key("temp"));
         assert!(!snap.contains_key("char"));
         assert!(!snap.contains_key("user"));
     }

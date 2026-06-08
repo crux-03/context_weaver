@@ -319,6 +319,7 @@ fn active_ids(blocks: &[AssembledBlock]) -> Vec<&str> {
 // ── The test ───────────────────────────────────────────────────────────
 
 #[test]
+#[cfg_attr(not(feature = "stdlib"), ignore)]
 fn test_multi_turn_rpg_session() {
     let mut engine = build_engine();
 
@@ -741,6 +742,7 @@ fn test_multi_turn_rpg_session() {
 /// Verify that document resolution works across multiple levels of nesting
 /// and that variables set by commands in one entry are visible in documents.
 #[test]
+#[cfg_attr(not(feature = "stdlib"), ignore)]
 fn test_document_chain_with_state_mutation() {
     let mut book = Lorebook::new();
 
@@ -799,6 +801,7 @@ End."#,
 /// Verify that a condition referencing state set in the SAME turn by
 /// another entry works correctly through the trigger mechanism.
 #[test]
+#[cfg_attr(not(feature = "stdlib"), ignore)]
 fn test_trigger_with_state_dependent_condition() {
     let mut book = Lorebook::new();
 
@@ -928,6 +931,7 @@ You should never see this."#,
 
 /// Verify that state persists across advance_turn calls.
 #[test]
+#[cfg_attr(not(feature = "stdlib"), ignore)]
 fn test_state_persistence_across_turns() {
     let mut book = Lorebook::new();
 

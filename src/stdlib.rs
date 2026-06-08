@@ -32,6 +32,8 @@
 use weaver_lang::registry::{CommandSignature, ParamDef, WeaverCommand};
 use weaver_lang::{ClosureProcessor, EvalContext, EvalError, EvalErrorKind, Registry, Value};
 
+const INVALID_VAR_CHARS: [char; 5] = ['{', ':', '}', '<', '>'];
+
 /// Register all standard library commands and processors.
 pub fn register(registry: &mut Registry) {
     register_commands(registry);
@@ -47,6 +49,7 @@ pub fn register(registry: &mut Registry) {
 fn register_commands(registry: &mut Registry) {
     registry.register_command(SetVarCommand);
     registry.register_command(GetVarCommand);
+    registry.register_command(VarExistsCommand);
     registry.register_command(IncVarCommand);
     registry.register_command(PushVarCommand);
     registry.register_command(DefaultVarCommand);
@@ -54,14 +57,28 @@ fn register_commands(registry: &mut Registry) {
 
 /// Parse a `"scope:name"` key string into (scope, name).
 fn parse_var_key(key: &str) -> Result<(&str, &str), EvalError> {
-    key.find(':')
+    let (ns, var) = key
+        .find(':')
         .map(|pos| (&key[..pos], &key[pos + 1..]))
         .ok_or_else(|| {
             EvalError::new(
                 EvalErrorKind::HostError,
                 format!("invalid variable key \"{key}\": expected \"scope:name\" format"),
             )
-        })
+        })?;
+
+    if ns.chars().any(|c| INVALID_VAR_CHARS.contains(&c))
+        || var.chars().any(|c| INVALID_VAR_CHARS.contains(&c))
+    {
+        return Err(EvalError::new(
+            EvalErrorKind::HostError,
+            format!(
+                "Invalid variable definition \"{key}\": contains one or more illegal characters: {INVALID_VAR_CHARS:?}"
+            ),
+        ));
+    }
+
+    Ok((ns, var))
 }
 
 // ── set_var ─────────────────────────────────────────────────────────────
@@ -129,6 +146,42 @@ impl WeaverCommand for GetVarCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "get_var".to_string(),
+            params: vec![ParamDef {
+                name: "key".to_string(),
+                expected_type: Some(weaver_lang::registry::ValueType::String),
+                required: true,
+            }],
+        }
+    }
+}
+
+// ── var_exists ──────────────────────────────────────────────────────────
+
+/// `$[var_exists("scope:name")]` — true if the variable is defined.
+///
+/// Returns `false` only when the variable is absent. A malformed key
+/// (missing the `scope:name` colon) is a usage error and propagates,
+/// matching `get_var` / `set_var`.
+struct VarExistsCommand;
+
+impl WeaverCommand for VarExistsCommand {
+    fn call(
+        &self,
+        args: Vec<Value>,
+        ctx: &mut dyn EvalContext,
+        _registry: &Registry,
+    ) -> Result<Option<Value>, EvalError> {
+        let key = args.first().and_then(|v| v.as_string()).ok_or_else(|| {
+            EvalError::type_error("string", args.first().map_or("none", |v| v.type_name()))
+        })?;
+        let (scope, name) = parse_var_key(key)?;
+        let exists = ctx.resolve_variable(scope, name)?.is_some();
+        Ok(Some(Value::Bool(exists)))
+    }
+
+    fn signature(&self) -> CommandSignature {
+        CommandSignature {
+            name: "var_exists".to_string(),
             params: vec![ParamDef {
                 name: "key".to_string(),
                 expected_type: Some(weaver_lang::registry::ValueType::String),
@@ -319,7 +372,7 @@ fn register_text_processors(registry: &mut Registry) {
     // @[text.length(text: "hello")] → 5
     registry.register_processor(ClosureProcessor::new("text", "length", |props| {
         let text = props.get("text").and_then(|v| v.as_string()).unwrap_or("");
-        Ok(Value::Number(text.len() as f64))
+        Ok(Value::Number(text.chars().count() as f64))
     }));
 
     // @[text.trim(text: "  hello  ")] → "hello"
@@ -608,8 +661,8 @@ fn register_array_processors(registry: &mut Registry) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use super::*;
+    use std::collections::HashMap;
 
     /// Simple EvalContext for testing commands in isolation.
     struct SimpleContext {
@@ -704,6 +757,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, Some(Value::Number(100.0)));
+    }
+
+    #[test]
+    fn test_var_exists() {
+        let registry = make_registry();
+        let mut ctx = SimpleContext::new();
+        ctx.set("global", "hp", 100i64);
+
+        let should_exist = registry
+            .call_command(
+                "var_exists",
+                vec![Value::String("global:hp".into())],
+                &mut ctx,
+            )
+            .unwrap();
+
+        let doesnt_exist = registry
+            .call_command(
+                "var_exists",
+                vec![Value::String("global:invalid".into())],
+                &mut ctx,
+            )
+            .unwrap();
+
+        let is_error = registry.call_command(
+            "var_exists",
+            vec![Value::String("not_a_variable".into())],
+            &mut ctx,
+        );
+
+        assert_eq!(should_exist, Some(Value::Bool(true)));
+        assert_eq!(doesnt_exist, Some(Value::Bool(false)));
+        assert!(is_error.is_err())
     }
 
     #[test]
@@ -968,6 +1054,29 @@ mod tests {
                 Value::Number(3.0),
             ])
         );
+    }
+
+    #[test]
+    fn test_invalid_variable_name() {
+        let registry = make_registry();
+        let mut ctx = SimpleContext::new();
+
+        let valid_expr = registry
+            .call_command(
+                "set_var",
+                vec![Value::String("global:hp".into()), Value::Number(10.0)],
+                &mut ctx,
+            )
+            .unwrap();
+
+        let invalid_var = registry.call_command(
+            "set_var",
+            vec![Value::String("{global:hp}".into()), Value::Number(10.0)],
+            &mut ctx,
+        );
+
+        assert_eq!(valid_expr, None);
+        assert!(invalid_var.is_err());
     }
 
     fn props(pairs: &[(&str, Value)]) -> HashMap<String, Value> {

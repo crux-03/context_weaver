@@ -193,7 +193,7 @@ impl ContextWeaver {
         let mut registry = Registry::new();
 
         host.reserve_namespace("state", NamespaceAccess::ReadWrite);
-        host.reserve_namespace("local", NamespaceAccess::ReadWrite);
+        host.reserve_namespace("temp", NamespaceAccess::ReadWrite);
 
         // Register built-in commands and processors
         register_builtins(&mut registry);
@@ -437,7 +437,7 @@ impl ContextWeaver {
             .collect();
 
         // Tell the host which entries are active (for trigger dedup and
-        // the is_active command via the _active namespace)
+        // the is_active / is_active_global commands).
         self.host
             .set_active_entries(active_ids.iter().cloned().collect());
 
@@ -793,33 +793,22 @@ fn register_builtins(registry: &mut Registry) {
         stdlib::register(registry);
     }
 
-    #[cfg(not(feature = "stdlib"))]
-    {
-        // Minimal built-in set when stdlib is disabled.
-        registry.register_processor(weaver_lang::ClosureProcessor::new(
-            "text",
-            "upper",
-            |props| {
-                let text = props.get("text").and_then(|v| v.as_string()).unwrap_or("");
-                Ok(Value::String(text.to_uppercase()))
-            },
-        ));
-        registry.register_processor(weaver_lang::ClosureProcessor::new(
-            "text",
-            "lower",
-            |props| {
-                let text = props.get("text").and_then(|v| v.as_string()).unwrap_or("");
-                Ok(Value::String(text.to_lowercase()))
-            },
-        ));
-    }
-
     // $[is_active("entry_id")] — check if an entry is currently active in the local lorebook.
-    // Uses the _active namespace populated by WeaverHost::set_active_entries.
+    // Reads the active-entry set by downcasting the context to WeaverHost.
     registry.register_command(IsActiveCommand);
     // $[is_active_global("entry_id")] — check if an entry is currently active in any loaded lorebook..
-    // Uses the _active_global namespace populated by WeaverHost::set_active_entries.
+    // Reads the active-entry set by downcasting the context to WeaverHost.
     registry.register_command(IsActiveGlobalCommand);
+}
+
+/// Downcast the evaluation context back to the concrete [`WeaverHost`].
+///
+/// The `is_active*` commands need host state — the active-entry set — that
+/// isn't expressible through the generic `EvalContext` variable API. When the
+/// context is some other `EvalContext` implementation the downcast fails and
+/// the commands treat every entry as inactive.
+fn as_weaver_host(ctx: &dyn EvalContext) -> Option<&WeaverHost> {
+    (ctx as &dyn std::any::Any).downcast_ref::<WeaverHost>()
 }
 
 // ── is_active command ──────────────────────────────────────────────────
@@ -827,9 +816,8 @@ fn register_builtins(registry: &mut Registry) {
 /// `$[is_active("entry_id")]` — check if a lorebook entry is active
 /// in the current evaluation pass.
 ///
-/// Returns `true` if the entry ID is in the active set, `false`
-/// otherwise. Works by reading the `_active` namespace which the
-/// engine populates before evaluation.
+/// Returns `true` if the entry is active in the *local* book (the book of the
+/// entry being evaluated), `false` otherwise.
 struct IsActiveCommand;
 
 impl WeaverCommand for IsActiveCommand {
@@ -843,9 +831,7 @@ impl WeaverCommand for IsActiveCommand {
             EvalError::type_error("string", args.first().map_or("none", |v| v.type_name()))
         })?;
 
-        let is_active = ctx
-            .resolve_variable("_active", id)?
-            .is_some_and(|v| v.is_truthy());
+        let is_active = as_weaver_host(ctx).is_some_and(|host| host.is_entry_active_local(id));
 
         Ok(Some(Value::Bool(is_active)))
     }
@@ -879,9 +865,7 @@ impl WeaverCommand for IsActiveGlobalCommand {
             EvalError::type_error("string", args.first().map_or("none", |v| v.type_name()))
         })?;
 
-        let is_active = ctx
-            .resolve_variable("_active_global", id)?
-            .is_some_and(|v| v.is_truthy());
+        let is_active = as_weaver_host(ctx).is_some_and(|host| host.is_entry_active(id));
 
         Ok(Some(Value::Bool(is_active)))
     }
