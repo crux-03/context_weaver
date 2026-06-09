@@ -113,14 +113,15 @@ impl IdResolver for DefaultIdResolver {
         books: &'a BookTemplates,
     ) -> Option<ResolvedRef<'a>> {
         // 1. Local book.
-        if let Some(origin) = origin {
-            if let Some(template) = books.get(origin, id) {
-                return Some(ResolvedRef {
-                    book: origin,
-                    template,
-                });
-            }
+        if let Some(origin) = origin
+            && let Some(template) = books.get(origin, id)
+        {
+            return Some(ResolvedRef {
+                book: origin,
+                template,
+            });
         }
+
         // 2. General context: the other books, in registration order.
         books
             .iter_except(origin)

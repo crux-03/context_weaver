@@ -84,11 +84,11 @@
 //! );
 //! ```
 
-use crate::{BookId, ChatMessage};
 use crate::activation::{ActivationResult, ActivationState};
 use crate::assembler::AssembledBlock;
 use crate::entry::Entry;
 use crate::lorebook::Lorebook;
+use crate::{BookId, ChatMessage};
 
 // ── Errors ──────────────────────────────────────────────────────────────
 

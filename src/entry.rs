@@ -21,8 +21,8 @@ use std::path::Path;
 use std::sync::Arc;
 use weaver_lang::{CompiledExpr, CompiledTemplate};
 
-use crate::assembler::Slot;
 use crate::ContextWeaverError;
+use crate::assembler::Slot;
 
 // ── Entry ───────────────────────────────────────────────────────────────
 
@@ -186,7 +186,9 @@ impl Entry {
                     // Log but don't fail — bad regexes are skipped
                     tracing::error!(
                         "warning: entry '{}': invalid regex '{}': {}",
-                        meta.id, pattern, e
+                        meta.id,
+                        pattern,
+                        e
                     );
                     None
                 }
@@ -206,6 +208,10 @@ impl Entry {
     pub fn load(path: &Path) -> Result<Self, ContextWeaverError> {
         let source = std::fs::read_to_string(path)?;
         Self::parse(&source, path.to_str())
+    }
+
+    pub fn to_source(&self) -> String {
+        self.source_body.clone()
     }
 }
 

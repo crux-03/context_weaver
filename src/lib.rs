@@ -95,6 +95,7 @@ pub use lifecycle::{
 pub use lorebook::{BookId, Lorebook, LorebookConfig, LorebookSet};
 pub use plugin::Plugin;
 pub use resolver::{BookTemplates, DefaultIdResolver, IdResolver, ResolvedRef};
+use serde::{Deserialize, Serialize};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -103,6 +104,8 @@ use weaver_lang::registry::{CommandSignature, ParamDef, WeaverCommand};
 use weaver_lang::{CompiledTemplate, EvalContext, EvalError, Registry, Value};
 
 // ── Top-level engine ────────────────────────────────────────────────────
+
+type EvaluatedEntries = Vec<((BookId, String), EvaluatedEntry)>;
 
 /// The main entry point for ContextWeaver.
 ///
@@ -126,13 +129,13 @@ pub struct ContextWeaver {
 }
 
 /// A chat message provided by the host application for activation scanning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatRole {
     User,
     Assistant,
@@ -290,30 +293,6 @@ impl ContextWeaver {
         if let Some(slot) = self.activation_states.get_mut(book.0) {
             *slot = state;
         }
-    }
-
-    /// Access the host's persistent state (for serialization).
-    ///
-    /// Note: this only covers the `state` namespace. To serialize *all*
-    /// writable context (book-declared scopes, etc.), use
-    /// [`export_persistent`](Self::export_persistent) instead.
-    #[deprecated(
-        since = "0.2.1",
-        note = "Superseded by `ContextWeaver::export_persistent`"
-    )]
-    pub fn persistent_state(&self) -> &HashMap<String, Value> {
-        #[allow(deprecated)]
-        self.host.persistent_state()
-    }
-
-    /// Restore persistent state (e.g. from a save file).
-    #[deprecated(
-        since = "0.2.1",
-        note = "Superseded by `ContextWeaver::restore_persistent`"
-    )]
-    pub fn restore_persistent_state(&mut self, state: HashMap<String, Value>) {
-        #[allow(deprecated)]
-        self.host.restore_persistent_state(state);
     }
 
     /// Export a full snapshot of every persistable namespace for
@@ -554,10 +533,10 @@ impl ContextWeaver {
                 .get(result.book)
                 .and_then(|b| b.get_entry(&result.entry_id))
                 .map(|e| e.meta.sticky_turns);
-            if let Some(sticky_turns) = sticky_turns {
-                if let Some(state) = self.activation_states.get_mut(result.book.0) {
-                    state.record_activation(&result.entry_id, sticky_turns);
-                }
+            if let Some(sticky_turns) = sticky_turns
+                && let Some(state) = self.activation_states.get_mut(result.book.0)
+            {
+                state.record_activation(&result.entry_id, sticky_turns);
             }
         }
 
@@ -609,21 +588,21 @@ impl ContextWeaver {
     fn evaluate_entries(
         &mut self,
         keys: &[(BookId, String)],
-    ) -> Result<Vec<((BookId, String), EvaluatedEntry)>, ContextWeaverError> {
+    ) -> Result<EvaluatedEntries, ContextWeaverError> {
         let mut results = Vec::new();
 
         for (book, id) in keys {
-            if let Some(entry) = self.books.get(*book).and_then(|b| b.get_entry(id)).cloned() {
-                if let Some(content) = self.evaluate_single_entry(*book, &entry)? {
-                    results.push((
-                        (*book, id.clone()),
-                        EvaluatedEntry {
-                            id: id.clone(),
-                            meta: entry.meta.clone(),
-                            content,
-                        },
-                    ));
-                }
+            if let Some(entry) = self.books.get(*book).and_then(|b| b.get_entry(id)).cloned()
+                && let Some(content) = self.evaluate_single_entry(*book, &entry)?
+            {
+                results.push((
+                    (*book, id.clone()),
+                    EvaluatedEntry {
+                        id: id.clone(),
+                        meta: entry.meta.clone(),
+                        content,
+                    },
+                ));
             }
         }
 

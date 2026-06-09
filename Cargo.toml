@@ -1,7 +1,7 @@
 [package]
 name = "context_weaver"
 authors = ["crux03"]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "A lorebook engine for LLM role-playing applications, built on weaver_lang"
 license = "MIT"
@@ -12,7 +12,7 @@ default = ["stdlib"]
 stdlib = []
 
 [dependencies]
-weaver_lang = { version="0.3.3", features = ["macros"] }
+weaver_lang = { version="0.3.4", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 regex = "1"

@@ -172,19 +172,19 @@ impl TokenBudget {
     /// Returns true if the entry fits.
     pub fn can_fit(&self, tokens: usize, group: Option<&str>) -> bool {
         // Check global budget
-        if let Some(total) = self.total {
-            if self.consumed_total + tokens > total {
-                return false;
-            }
+        if let Some(total) = self.total
+            && self.consumed_total + tokens > total
+        {
+            return false;
         }
 
         // Check group budget
-        if let Some(group_name) = group {
-            if let Some(group_budget) = self.groups.get(group_name) {
-                let consumed = self.consumed_groups.get(group_name).copied().unwrap_or(0);
-                if consumed + tokens > *group_budget {
-                    return false;
-                }
+        if let Some(group_name) = group
+            && let Some(group_budget) = self.groups.get(group_name)
+        {
+            let consumed = self.consumed_groups.get(group_name).copied().unwrap_or(0);
+            if consumed + tokens > *group_budget {
+                return false;
             }
         }
 

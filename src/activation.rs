@@ -159,7 +159,7 @@ impl ActivationEngine {
             ));
         }
         // Global priority order; stable sort preserves per-book order within ties.
-        all.sort_by(|a, b| b.priority.cmp(&a.priority));
+        all.sort_by_key(|b| std::cmp::Reverse(b.priority));
         all
     }
 
@@ -196,10 +196,10 @@ impl ActivationEngine {
         // they don't get a fresh keyword/regex/constant activation below.
         let mut sticky_carry: HashMap<String, (usize, i32)> = HashMap::new();
         for (entry_id, remaining) in state.sticky_entries() {
-            if let Some(entry) = lorebook.get_entry(entry_id) {
-                if entry.meta.enabled {
-                    sticky_carry.insert(entry_id.to_string(), (remaining, entry.meta.priority));
-                }
+            if let Some(entry) = lorebook.get_entry(entry_id)
+                && entry.meta.enabled
+            {
+                sticky_carry.insert(entry_id.to_string(), (remaining, entry.meta.priority));
             }
         }
 
@@ -294,7 +294,7 @@ impl ActivationEngine {
         }
 
         // Sort by priority (descending)
-        activated.sort_by(|a, b| b.priority.cmp(&a.priority));
+        activated.sort_by_key(|b| std::cmp::Reverse(b.priority));
 
         activated
     }
@@ -343,7 +343,7 @@ impl ActivationEngine {
             }
         }
 
-        results.sort_by(|a, b| b.priority.cmp(&a.priority));
+        results.sort_by_key(|b| std::cmp::Reverse(b.priority));
         results
     }
 }

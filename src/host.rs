@@ -229,31 +229,6 @@ impl WeaverHost {
 
     // ── Persistent state ────────────────────────────────────────────
 
-    /// Get the persistent state map (for serialization between sessions).
-    #[deprecated(
-        since = "0.2.1",
-        note = "Superseded by `WeaverHost::export_persistent`"
-    )]
-    pub fn persistent_state(&self) -> &HashMap<String, Value> {
-        &self.persistent_state
-    }
-
-    /// Restore persistent state (e.g. loaded from a save file).
-    ///
-    /// Note: this only restores the `state` namespace. For a full snapshot
-    /// covering every writable namespace, prefer
-    /// [`restore_persistent`](Self::restore_persistent).
-    #[deprecated(
-        since = "0.2.1",
-        note = "Superseded by `WeaverHost::restore_persistent`"
-    )]
-    pub fn restore_persistent_state(&mut self, state: HashMap<String, Value>) {
-        self.persistent_state = state;
-        // Mirror into the variables map so templates can access it
-        self.variables
-            .insert("state".to_string(), self.persistent_state.clone());
-    }
-
     /// Snapshot every persistable namespace for serialization between
     /// sessions, as `namespace → (name → value)`.
     ///
@@ -304,7 +279,7 @@ impl WeaverHost {
     /// Whether a scope's contents should be persisted: it is writable by some
     /// book or reserved `ReadWrite` (so a template could have mutated it), and
     /// it is not the transient `temp` namespace.
-    /// 
+    ///
     /// Additionally namespaces that starts with an underscore are considered
     /// non-persistent scopes by convention.
     fn is_scope_persistable(&self, scope: &str) -> bool {
@@ -361,16 +336,18 @@ impl EvalContext for WeaverHost {
         }
 
         // ── Stored variables ────────────────────────────────────────
-        if let Some(ns) = self.variables.get(scope) {
-            if let Some(val) = ns.get(name) {
-                return Ok(Some(val.clone()));
-            }
+        if let Some(ns) = self.variables.get(scope)
+            && let Some(val) = ns.get(name)
+        {
+            return Ok(Some(val.clone()));
         }
-        if scope == "state" {
-            if let Some(val) = self.persistent_state.get(name) {
-                return Ok(Some(val.clone()));
-            }
+
+        if scope == "state"
+            && let Some(val) = self.persistent_state.get(name)
+        {
+            return Ok(Some(val.clone()));
         }
+
         Ok(None)
     }
 

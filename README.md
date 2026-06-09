@@ -37,12 +37,16 @@ Pre-release. The architecture is stable and the test suite is comprehensive, but
 ## Quick start
 
 ```rust
-use context_weaver::{ContextWeaver, Lorebook, ChatMessage};
+use context_weaver::{ContextWeaver, Lorebook, ChatMessage, NamespaceAccess};
 
 // Load a lorebook from disk
 let book = Lorebook::load_from_directory("./my_character/lorebook")?;
 
 let mut weaver = ContextWeaver::new(book);
+
+// Namespaces entries cannot modify
+weaver.reserve_namespace("char", NamespaceAccess::ReadOnly);
+weaver.reserve_namespace("user", NamespaceAccess::ReadOnly);
 
 // Feed host data into read-only namespaces
 weaver.set_variable("char", "name", "Aria");
@@ -74,7 +78,7 @@ for block in &blocks {
 ┌────────────────────────▼────────────────────────────┐
 │  ContextWeaver                                      │
 │                                                     │
-│  Lorebook → Activation → Evaluation → Assembly      │
+│  Lorebook(s) → Activation → Evaluation → Assembly   │
 │                                                     │
 │  Plugin Registry (processors and commands)          │
 │  Lifecycle Plugins (pipeline hooks)                 │
@@ -148,7 +152,7 @@ my_character/
 
 ### Host context
 
-* **Namespaces** with configurable access (`ReadOnly` for host-provided data like `char`, `user`, `chat`; `ReadWrite` for template-mutable state like `state` and `local`).
+* **Namespaces** with configurable access (`ReadOnly` for host-provided data like `char`, `user`, `chat`; `ReadWrite` for template-mutable state like `state` and `local`). Each lorebook may define auxiliary namespaces, and multiple books can target the same namespace with differing (or equal) permissions.
 * **Persistent state** in the `state:` namespace survives across turns and is exposed for save/load.
 * **Recursion and cycle detection** for the `[[entry_id]]` document-inlining mechanism.
 * **DoS bounds** on template evaluation via `max_node_evaluations` and `max_iterations`.
@@ -157,7 +161,7 @@ my_character/
 
 Enabled by the `stdlib` feature (on by default):
 
-* **Commands** that mutate state: `set_var`, `get_var`, `inc_var`, `push_var`, `default_var`, `is_active`.
+* **Commands** that mutate state: `set_var`, `get_var`, `var_exists`, `inc_var`, `push_var`, `default_var`, `is_active`.
 * **`text.*`** processors: `upper`, `lower`, `length`, `trim`, `capitalize`, `contains`, `starts_with`, `ends_with`, `replace`, `substr`, `join`, `repeat`.
 * **`math.*`** processors: `add`, `sub`, `mul`, `div`, `mod`, `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`.
 * **`array.*`** processors: `length`, `contains`, `first`, `last`, `reverse`, `slice`, `range`, `concat`.
@@ -189,7 +193,23 @@ weaver.register_plugin(DicePlugin);
 
 Templates then call `@[dice.roll(sides: 20)]`.
 
-For type-safe processors with automatic validation, the [`weaver-macros`](https://github.com/crux-03/weaver_lang) crate provides `#[weaver_processor]` and `#[weaver_command]` attributes.
+For type-safe processors with automatic validation, the [`weaver_macros`](https://crates.io/crates/weaver_macros) crate provides `#[weaver_processor]` and `#[weaver_command]` attributes to make creation more simple:
+```rust
+#[weaver_processor(namespace = "dice", name = "roll")]
+fn repeat_text(sides: f64) -> Result<Value, EvalError> {
+    let sides = sides as u32;
+    let result = rand::random::<u32>() % sides + 1;
+    Ok(Value::Number(result as f64))
+}
+
+#[weaver_command(name = "set_var")]
+fn set_var(key: String, value: Value, ctx: &mut dyn EvalContext) -> Result<Option<Value>, EvalError> {
+    if let Some(pos) = key.find(':') {
+        ctx.set_variable(&key[..pos], &key[pos + 1..], value)?;
+    }
+    Ok(None)
+}
+```
 
 ### Lifecycle plugins
 
@@ -246,11 +266,11 @@ Both the activation state (sticky counters, cooldown timers, turn counter) and t
 
 ```rust
 let activation_snapshot = weaver.activation_state().clone();
-let state_snapshot = weaver.persistent_state().clone();
+let state_snapshot = weaver.export_persistent().clone();
 
 // ...later...
 
-weaver.restore_activation_state(activation_snapshot);
+weaver.restore_activation_state(BookId(0), activation_snapshot);
 weaver.restore_persistent_state(state_snapshot);
 ```
 
@@ -258,14 +278,9 @@ Both types derive `Serialize` and `Deserialize`, so any serde-compatible format 
 
 ## Roadmap
 
-### v0.1.0 (current focus)
-
 **Serialization**
 
 * `format_version: u32` field on `LorebookConfig`. Currently absent, which makes forward-compat impossible.
-* `Entry::to_source() -> String` to round-trip an entry back to its `.weaver` representation.
-* `Lorebook::to_bundle() / from_bundle()` for single-blob export, with PNG tEXt embedding and database storage as primary use cases.
-* `Serialize`/`Deserialize` on `ChatMessage` and `ChatRole`.
 * Round-trip test specifically for `Slot::AtDepth(N)` in both YAML and JSON.
 
 **Author experience**
@@ -273,12 +288,9 @@ Both types derive `Serialize` and `Deserialize`, so any serde-compatible format 
 * Expose `ActivationReason` and the full activation trace alongside `assemble`'s return value so authors can debug "why didn't my entry fire?" without instrumenting the engine themselves.
 * `LorebookBuilder` for programmatic construction.
 
-### v0.2.0
+**Future**
 
 * **Per-entry token cap** in addition to global and group budgets.
-* **Embedding-based activation hook.** A trait the host can implement to plug in vector-similarity matching alongside keyword and regex.
-* **SillyTavern `character_book.json` interop.** `From`/`Into` impls for the de facto interchange format.
-* **Plugin conflict detection and load ordering.** Currently last-write-wins on processor name collisions, silently.
 * **Async lifecycle hooks** for plugins that need to hit external APIs from within a phase.
 * **Read-only registry access from lifecycle hook contexts**, for hooks that want to call processors over content.
 
