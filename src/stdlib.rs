@@ -105,18 +105,23 @@ impl WeaverCommand for SetVarCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "set_var".to_string(),
+            description: "Set a variable in any writable scope".to_string(),
+            returns: weaver_lang::registry::ValueType::None,
             params: vec![
                 ParamDef {
                     name: "key".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::String),
                     required: true,
                 },
                 ParamDef {
                     name: "value".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::Any),
                     required: true,
                 },
             ],
+            mutates_context: true,
         }
     }
 }
@@ -146,11 +151,15 @@ impl WeaverCommand for GetVarCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "get_var".to_string(),
+            description: "Read a variable and return it".to_string(),
+            returns: weaver_lang::registry::ValueType::Any,
             params: vec![ParamDef {
                 name: "key".to_string(),
+                description: String::new(),
                 expected_type: Some(weaver_lang::registry::ValueType::String),
                 required: true,
             }],
+            mutates_context: true,
         }
     }
 }
@@ -182,11 +191,15 @@ impl WeaverCommand for VarExistsCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "var_exists".to_string(),
+            description: "Report whether a variable is defined".to_string(),
+            returns: weaver_lang::registry::ValueType::Bool,
             params: vec![ParamDef {
                 name: "key".to_string(),
+                description: String::new(),
                 expected_type: Some(weaver_lang::registry::ValueType::String),
                 required: true,
             }],
+            mutates_context: true,
         }
     }
 }
@@ -229,18 +242,23 @@ impl WeaverCommand for IncVarCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "inc_var".to_string(),
+            description: "Increment a numeric variable".to_string(),
+            returns: weaver_lang::registry::ValueType::None,
             params: vec![
                 ParamDef {
                     name: "key".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::String),
                     required: true,
                 },
                 ParamDef {
                     name: "amount".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::Number),
                     required: false,
                 },
             ],
+            mutates_context: true,
         }
     }
 }
@@ -286,18 +304,23 @@ impl WeaverCommand for PushVarCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "push_var".to_string(),
+            description: "Append a value to an array variable".to_string(),
+            returns: weaver_lang::registry::ValueType::None,
             params: vec![
                 ParamDef {
                     name: "key".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::String),
                     required: true,
                 },
                 ParamDef {
                     name: "value".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::Any),
                     required: true,
                 },
             ],
+            mutates_context: true,
         }
     }
 }
@@ -336,18 +359,23 @@ impl WeaverCommand for DefaultVarCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "default_var".to_string(),
+            description: "Set a variable only if it is not already defined".to_string(),
+            returns: weaver_lang::registry::ValueType::None,
             params: vec![
                 ParamDef {
                     name: "key".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::String),
                     required: true,
                 },
                 ParamDef {
                     name: "value".to_string(),
+                    description: String::new(),
                     expected_type: Some(weaver_lang::registry::ValueType::Any),
                     required: true,
                 },
             ],
+            mutates_context: true,
         }
     }
 }

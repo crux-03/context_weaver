@@ -764,6 +764,19 @@ impl From<std::io::Error> for ContextWeaverError {
 
 // ── Built-in commands & processors ──────────────────────────────────────
 
+/// Signatures of the lorebook host commands (`is_active`, `is_active_global`)
+/// that every [`ContextWeaver`] registers automatically.
+///
+/// These live on the engine, not in the standard library, so a host building
+/// editor tooling needs them to show the full vocabulary available inside a
+/// lorebook entry alongside [`weaver_lang::Registry::command_signatures`].
+pub fn host_command_signatures() -> Vec<CommandSignature> {
+    vec![
+        IsActiveCommand.signature(),
+        IsActiveGlobalCommand.signature(),
+    ]
+}
+
 fn register_builtins(registry: &mut Registry) {
     // When the stdlib feature is enabled, register the full standard library.
     // Otherwise, register minimal placeholders.
@@ -818,11 +831,15 @@ impl WeaverCommand for IsActiveCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "is_active".to_string(),
+            description: "Check if a lorebook entry is active in the local book".to_string(),
+            returns: weaver_lang::registry::ValueType::Bool,
             params: vec![ParamDef {
                 name: "entry_id".to_string(),
+                description: String::new(),
                 expected_type: Some(weaver_lang::registry::ValueType::String),
                 required: true,
             }],
+            mutates_context: true,
         }
     }
 }
@@ -852,11 +869,15 @@ impl WeaverCommand for IsActiveGlobalCommand {
     fn signature(&self) -> CommandSignature {
         CommandSignature {
             name: "is_active_global".to_string(),
+            description: "Check if an entry with this id is active in any book".to_string(),
+            returns: weaver_lang::registry::ValueType::Bool,
             params: vec![ParamDef {
                 name: "entry_id".to_string(),
+                description: String::new(),
                 expected_type: Some(weaver_lang::registry::ValueType::String),
                 required: true,
             }],
+            mutates_context: true,
         }
     }
 }
