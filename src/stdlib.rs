@@ -81,6 +81,48 @@ fn parse_var_key(key: &str) -> Result<(&str, &str), EvalError> {
     Ok((ns, var))
 }
 
+/// Split a variable name into the root and the path that indexes into it.
+///
+/// `"alice.stats.hp"` yields `("alice", ["stats", "hp"])`. The root is the
+/// only part [`EvalContext`] resolves; everything after the first dot
+/// addresses keys inside the resolved value.
+fn split_name(name: &str) -> (&str, Vec<String>) {
+    let mut segments = name.split('.');
+    let root = segments.next().unwrap_or(name);
+    (root, segments.map(String::from).collect())
+}
+
+/// Read a variable, following any dotted path into the resolved value.
+fn read_var(ctx: &dyn EvalContext, scope: &str, name: &str) -> Result<Option<Value>, EvalError> {
+    let (root, path) = split_name(name);
+    ctx.resolve_variable_path(scope, root, &path)
+}
+
+/// Write a variable, folding any dotted path into nested objects.
+///
+/// [`EvalContext`] has no path-aware setter — the language has no assignment
+/// syntax, so weaver_lang leaves the write side to the host. A nested write
+/// is therefore a read-modify-write of the root value via
+/// [`Value::set_path`], which creates missing intermediate objects and
+/// rejects an intermediate that exists but is not an object.
+fn write_var(
+    ctx: &mut dyn EvalContext,
+    scope: &str,
+    name: &str,
+    value: Value,
+) -> Result<(), EvalError> {
+    let (root, path) = split_name(name);
+    if path.is_empty() {
+        return ctx.set_variable(scope, root, value);
+    }
+
+    let mut root_value = ctx.resolve_variable(scope, root)?.unwrap_or(Value::None);
+    root_value
+        .set_path(&path, value)
+        .map_err(|e| EvalError::new(EvalErrorKind::TypeError, e.to_string()))?;
+    ctx.set_variable(scope, root, root_value)
+}
+
 // ── set_var ─────────────────────────────────────────────────────────────
 
 /// `$[set_var("scope:name", value)]` — set a variable in any writable scope.
@@ -98,7 +140,7 @@ impl WeaverCommand for SetVarCommand {
         })?;
         let value = args.get(1).cloned().unwrap_or(Value::None);
         let (scope, name) = parse_var_key(key)?;
-        ctx.set_variable(scope, name, value)?;
+        write_var(ctx, scope, name, value)?;
         Ok(None)
     }
 
@@ -142,7 +184,7 @@ impl WeaverCommand for GetVarCommand {
             EvalError::type_error("string", args.first().map_or("none", |v| v.type_name()))
         })?;
         let (scope, name) = parse_var_key(key)?;
-        match ctx.resolve_variable(scope, name)? {
+        match read_var(ctx, scope, name)? {
             Some(val) => Ok(Some(val)),
             None => Ok(Some(Value::None)),
         }
@@ -184,7 +226,7 @@ impl WeaverCommand for VarExistsCommand {
             EvalError::type_error("string", args.first().map_or("none", |v| v.type_name()))
         })?;
         let (scope, name) = parse_var_key(key)?;
-        let exists = ctx.resolve_variable(scope, name)?.is_some();
+        let exists = read_var(ctx, scope, name)?.is_some();
         Ok(Some(Value::Bool(exists)))
     }
 
@@ -226,7 +268,7 @@ impl WeaverCommand for IncVarCommand {
 
         let (scope, name) = parse_var_key(key)?;
 
-        let current = ctx.resolve_variable(scope, name)?;
+        let current = read_var(ctx, scope, name)?;
         let new_val = match current {
             Some(Value::Number(n)) => n + amount,
             Some(other) => {
@@ -235,7 +277,7 @@ impl WeaverCommand for IncVarCommand {
             None => amount,
         };
 
-        ctx.set_variable(scope, name, Value::Number(new_val))?;
+        write_var(ctx, scope, name, Value::Number(new_val))?;
         Ok(None)
     }
 
@@ -285,7 +327,7 @@ impl WeaverCommand for PushVarCommand {
 
         let (scope, name) = parse_var_key(key)?;
 
-        let current = ctx.resolve_variable(scope, name)?;
+        let current = read_var(ctx, scope, name)?;
         let new_arr = match current {
             Some(Value::Array(mut arr)) => {
                 arr.push(value);
@@ -297,7 +339,7 @@ impl WeaverCommand for PushVarCommand {
             None => vec![value],
         };
 
-        ctx.set_variable(scope, name, Value::Array(new_arr))?;
+        write_var(ctx, scope, name, Value::Array(new_arr))?;
         Ok(None)
     }
 
@@ -347,10 +389,10 @@ impl WeaverCommand for DefaultVarCommand {
 
         let (scope, name) = parse_var_key(key)?;
 
-        match ctx.resolve_variable(scope, name)? {
+        match read_var(ctx, scope, name)? {
             Some(_) => Ok(None), // already set, skip
             None => {
-                ctx.set_variable(scope, name, default)?;
+                write_var(ctx, scope, name, default)?;
                 Ok(None)
             }
         }
@@ -973,6 +1015,153 @@ mod tests {
 
         let val = ctx.resolve_variable("global", "x").unwrap();
         assert_eq!(val, Some(Value::Number(10.0)));
+    }
+
+    // ── Dotted path tests ───────────────────────────────────────────
+
+    fn set_var(registry: &Registry, ctx: &mut SimpleContext, key: &str, value: impl Into<Value>) {
+        registry
+            .call_command(
+                "set_var",
+                vec![Value::String(key.into()), value.into()],
+                ctx,
+            )
+            .unwrap();
+    }
+
+    /// The regression that motivated the migration: a dotted `set_var` key
+    /// must be readable through the template syntax that spells it the same
+    /// way. Before 0.5.0 both sides agreed on a flat `"alice.hp"` key; now
+    /// the write folds into an object and the read walks into it.
+    #[test]
+    fn test_dotted_set_var_reads_back_in_template() {
+        let registry = make_registry();
+        let mut ctx = SimpleContext::new();
+        set_var(&registry, &mut ctx, "global:alice.stats.hp", 10i64);
+
+        let template = weaver_lang::parse("{{global:alice.stats.hp}}").unwrap();
+        let out = weaver_lang::evaluate(&template, &mut ctx, &registry).unwrap();
+        assert_eq!(out, "10");
+
+        // The host stores one object under the root, not a flat dotted key.
+        assert_eq!(
+            ctx.resolve_variable("global", "alice").unwrap(),
+            Some(Value::object([(
+                "stats",
+                Value::object([("hp", Value::Number(10.0))])
+            )]))
+        );
+    }
+
+    /// Writing a second leaf must not clobber the first.
+    #[test]
+    fn test_dotted_set_var_merges_into_existing_object() {
+        let registry = make_registry();
+        let mut ctx = SimpleContext::new();
+        set_var(&registry, &mut ctx, "global:alice.hp", 10i64);
+        set_var(&registry, &mut ctx, "global:alice.mp", 3i64);
+
+        assert_eq!(
+            ctx.resolve_variable("global", "alice").unwrap(),
+            Some(Value::object([
+                ("hp", Value::Number(10.0)),
+                ("mp", Value::Number(3.0)),
+            ]))
+        );
+    }
+
+    /// Every read command follows the path, so they agree with each other
+    /// and with the template.
+    #[test]
+    fn test_dotted_read_commands() {
+        let registry = make_registry();
+        let mut ctx = SimpleContext::new();
+        set_var(&registry, &mut ctx, "global:alice.hp", 10i64);
+
+        let got = registry
+            .call_command(
+                "get_var",
+                vec![Value::String("global:alice.hp".into())],
+                &mut ctx,
+            )
+            .unwrap();
+        assert_eq!(got, Some(Value::Number(10.0)));
+
+        let exists = registry
+            .call_command(
+                "var_exists",
+                vec![Value::String("global:alice.hp".into())],
+                &mut ctx,
+            )
+            .unwrap();
+        assert_eq!(exists, Some(Value::Bool(true)));
+
+        let missing = registry
+            .call_command(
+                "var_exists",
+                vec![Value::String("global:alice.luck".into())],
+                &mut ctx,
+            )
+            .unwrap();
+        assert_eq!(missing, Some(Value::Bool(false)));
+    }
+
+    /// The read-modify-write commands read and write the same path.
+    #[test]
+    fn test_dotted_read_modify_write_commands() {
+        let registry = make_registry();
+        let mut ctx = SimpleContext::new();
+
+        registry
+            .call_command(
+                "default_var",
+                vec![Value::String("global:alice.hp".into()), Value::Number(10.0)],
+                &mut ctx,
+            )
+            .unwrap();
+        registry
+            .call_command(
+                "inc_var",
+                vec![Value::String("global:alice.hp".into()), Value::Number(5.0)],
+                &mut ctx,
+            )
+            .unwrap();
+        registry
+            .call_command(
+                "push_var",
+                vec![
+                    Value::String("global:alice.bag".into()),
+                    Value::String("sword".into()),
+                ],
+                &mut ctx,
+            )
+            .unwrap();
+
+        assert_eq!(
+            ctx.resolve_variable("global", "alice").unwrap(),
+            Some(Value::object([
+                ("bag", Value::Array(vec![Value::String("sword".into())])),
+                ("hp", Value::Number(15.0)),
+            ]))
+        );
+    }
+
+    /// Indexing through a non-object is a type error, not a silent
+    /// overwrite of the scalar that is in the way.
+    #[test]
+    fn test_dotted_write_through_scalar_is_type_error() {
+        let registry = make_registry();
+        let mut ctx = SimpleContext::new();
+        set_var(&registry, &mut ctx, "global:hp", 10i64);
+
+        let err = registry
+            .call_command(
+                "set_var",
+                vec![Value::String("global:hp.max".into()), Value::Number(20.0)],
+                &mut ctx,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, EvalErrorKind::TypeError);
     }
 
     // ── Text processor tests ────────────────────────────────────────

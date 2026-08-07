@@ -40,7 +40,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "context_weaver"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "regex",
  "serde",
@@ -581,9 +581,9 @@ dependencies = [
 
 [[package]]
 name = "weaver_lang"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8c09214322293acfb111e31e84875d55ac6d9446aefc3097936559cbd046f3c"
+checksum = "03eccf30c48151510ccf5ccb9599e38ba55f2e4bc05f6d5d2951336e99e0db93"
 dependencies = [
  "pest",
  "pest_derive",
