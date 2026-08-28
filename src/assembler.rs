@@ -336,6 +336,7 @@ fn resolve_slot(primary: &Slot, fallback: &[Slot], available: &HashSet<Slot>) ->
 mod tests {
     use super::*;
     use crate::entry::EntryMeta;
+    use weaver_lang::Value;
 
     fn all_slots() -> HashSet<Slot> {
         Slot::standard_slots().into_iter().collect()
@@ -373,11 +374,13 @@ mod tests {
                 id: "empty".into(),
                 meta: make_meta("empty", 100),
                 content: "   \n  ".into(),
+                value: Value::String("   \n  ".into()),
             },
             EvaluatedEntry {
                 id: "has_content".into(),
                 meta: make_meta("has_content", 100),
                 content: "Hello!".into(),
+                value: Value::String("Hello!".into()),
             },
         ];
 

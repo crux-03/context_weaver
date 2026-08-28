@@ -20,7 +20,7 @@
 //! checks inventory, and tests cooldown/sticky mechanics.
 
 use context_weaver::{
-    AssembledBlock, ChatMessage, ContextWeaver, Entry, Lorebook, NamespaceAccess, Slot,
+    AssembledBlock, BookId, ChatMessage, ContextWeaver, Entry, Lorebook, NamespaceAccess, Slot,
 };
 use weaver_lang::Value;
 
@@ -1136,4 +1136,228 @@ Injected at depth"#,
     assert_block_contains(&blocks, "depth_entry", "Injected at depth");
     let block = find_block(&blocks, "depth_entry").unwrap();
     assert_eq!(block.slot, Slot::AtDepth(3));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Document values (weaver_lang 0.6 return statements)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// An entry that ends in `{# return [...] #}` is a value-producing unit:
+/// the including entry gets the array itself and can iterate it, rather
+/// than the array's rendered text.
+#[test]
+fn test_returned_array_is_iterable_through_document_ref() {
+    let mut book = Lorebook::new();
+
+    let loot_table = Entry::parse(
+        r#"---
+id: loot_table
+---
+{# return ["sword", "shield", "potion"] #}"#,
+        None,
+    )
+    .unwrap();
+
+    let listing = Entry::parse(
+        r#"---
+id: listing
+constant: true
+---
+Loot:
+{# foreach item in [[loot_table]] #}
+- {{item}}
+{# endforeach #}"#,
+        None,
+    )
+    .unwrap();
+
+    book.add_entry(loot_table);
+    book.add_entry(listing);
+
+    let mut engine = ContextWeaver::new(book);
+    let blocks = engine.assemble(&[]).unwrap();
+
+    let block = find_block(&blocks, "listing").expect("listing should be active");
+    assert!(
+        block.content.contains("- sword")
+            && block.content.contains("- shield")
+            && block.content.contains("- potion"),
+        "each returned item should get its own line. Got: {}",
+        block.content
+    );
+}
+
+/// A returned value used in template position still renders — it is the
+/// value passed through `to_output_string`.
+#[test]
+fn test_returned_value_renders_in_template_position() {
+    let mut book = Lorebook::new();
+
+    book.add_entry(
+        Entry::parse(
+            r#"---
+id: hp_budget
+---
+{# return 42 #}"#,
+            None,
+        )
+        .unwrap(),
+    );
+    book.add_entry(
+        Entry::parse(
+            r#"---
+id: status
+constant: true
+---
+HP: [[hp_budget]]"#,
+            None,
+        )
+        .unwrap(),
+    );
+
+    let mut engine = ContextWeaver::new(book);
+    let blocks = engine.assemble(&[]).unwrap();
+
+    assert_block_contains(&blocks, "status", "HP: 42");
+}
+
+/// A bare `{# return #}` yields `none`, so a guarded entry contributes
+/// nothing and the assembler drops it.
+#[test]
+#[cfg_attr(not(feature = "stdlib"), ignore)]
+fn test_guarded_entry_returning_none_is_dropped() {
+    let source = r#"---
+id: wound_status
+constant: true
+---
+{# if {{state:hp}} > 50 #}{# return #}{# endif #}
+Wounded: {{state:hp}} HP"#;
+
+    // Healthy: the entry returns none and never reaches the prompt.
+    let mut book = Lorebook::new();
+    book.add_entry(Entry::parse(source, None).unwrap());
+    let mut engine = ContextWeaver::new(book);
+    engine.set_variable("state", "hp", 80.0);
+    let blocks = engine.assemble(&[]).unwrap();
+    assert!(
+        find_block(&blocks, "wound_status").is_none(),
+        "an entry returning none should be dropped"
+    );
+
+    // Wounded: the guard doesn't fire, so the prose renders.
+    let mut book = Lorebook::new();
+    book.add_entry(Entry::parse(source, None).unwrap());
+    let mut engine = ContextWeaver::new(book);
+    engine.set_variable("state", "hp", 20.0);
+    let blocks = engine.assemble(&[]).unwrap();
+    assert_block_contains(&blocks, "wound_status", "Wounded: 20 HP");
+}
+
+/// `{# stop #}` truncates: the text rendered before it is kept.
+#[test]
+fn test_stop_keeps_rendered_output() {
+    let mut book = Lorebook::new();
+    book.add_entry(
+        Entry::parse(
+            r#"---
+id: truncated
+constant: true
+---
+Kept.
+{# stop #}
+Draft notes that never reach the output."#,
+            None,
+        )
+        .unwrap(),
+    );
+
+    let mut engine = ContextWeaver::new(book);
+    let blocks = engine.assemble(&[]).unwrap();
+
+    let block = find_block(&blocks, "truncated").expect("truncated should be active");
+    assert!(block.content.contains("Kept."), "Got: {}", block.content);
+    assert!(
+        !block.content.contains("Draft notes"),
+        "text after stop should not reach the output. Got: {}",
+        block.content
+    );
+}
+
+/// `evaluate_entry_value` hands a lorebook entry back as data rather than
+/// prose, for hosts that use entries as configuration or tables.
+#[test]
+fn test_evaluate_entry_value() {
+    let mut book = Lorebook::new();
+    book.add_entry(
+        Entry::parse(
+            r#"---
+id: loot_table
+---
+{# return ["sword", "shield"] #}"#,
+            None,
+        )
+        .unwrap(),
+    );
+    book.add_entry(
+        Entry::parse(
+            r#"---
+id: greeting
+---
+Hello, {{user:name}}."#,
+            None,
+        )
+        .unwrap(),
+    );
+
+    let mut engine = ContextWeaver::new(book);
+    engine.reserve_namespace("user", NamespaceAccess::ReadOnly);
+    engine.set_variable("user", "name", "Alex");
+
+    let value = engine
+        .evaluate_entry_value(BookId(0), "loot_table")
+        .unwrap()
+        .expect("no hook skipped this entry");
+    assert_eq!(
+        value,
+        Value::Array(vec![
+            Value::String("sword".into()),
+            Value::String("shield".into())
+        ])
+    );
+
+    // An entry without a return is still a value — its rendered text.
+    let value = engine
+        .evaluate_entry_value(BookId(0), "greeting")
+        .unwrap()
+        .expect("no hook skipped this entry");
+    assert_eq!(value, Value::String("Hello, Alex.".into()));
+
+    assert!(matches!(
+        engine.evaluate_entry_value(BookId(0), "nope"),
+        Err(context_weaver::ContextWeaverError::EntryNotFound { .. })
+    ));
+}
+
+/// Trim markers are additive in 0.6 and work through the engine.
+#[test]
+fn test_trim_markers_collapse_whitespace() {
+    let mut book = Lorebook::new();
+    book.add_entry(
+        Entry::parse(
+            r#"---
+id: trimmed
+constant: true
+---
+A   {{-user:name-}}   B"#,
+            None,
+        )
+        .unwrap(),
+    );
+
+    let mut engine = ContextWeaver::new(book);
+    engine.reserve_namespace("user", NamespaceAccess::ReadOnly);
+    engine.set_variable("user", "name", "Alex");
+
+    let blocks = engine.assemble(&[]).unwrap();
+    assert_block_contains(&blocks, "trimmed", "AAlexB");
 }

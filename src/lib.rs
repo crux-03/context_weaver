@@ -30,6 +30,7 @@
 //! │  │  - read-only enforcement                     │   │
 //! │  │  - trigger collection (no output)            │   │
 //! │  │  - document → recursive entry evaluation     │   │
+//! │  │  - document values (`{# return expr #}`)     │   │
 //! │  └──────────────────────────────────────────────┘   │
 //! │                                                     │
 //! │  ┌──────────────────────────────────────────────┐   │
@@ -593,7 +594,7 @@ impl ContextWeaver {
 
         for (book, id) in keys {
             if let Some(entry) = self.books.get(*book).and_then(|b| b.get_entry(id)).cloned()
-                && let Some(content) = self.evaluate_single_entry(*book, &entry)?
+                && let Some((value, content)) = self.evaluate_single_entry(*book, &entry)?
             {
                 results.push((
                     (*book, id.clone()),
@@ -601,6 +602,7 @@ impl ContextWeaver {
                         id: id.clone(),
                         meta: entry.meta.clone(),
                         content,
+                        value,
                     },
                 ));
             }
@@ -615,7 +617,7 @@ impl ContextWeaver {
         &mut self,
         book: BookId,
         entry: &Entry,
-    ) -> Result<Option<String>, ContextWeaverError> {
+    ) -> Result<Option<(Value, String)>, ContextWeaverError> {
         // ── Lifecycle: pre_evaluate ─────────────────────────────────
         let mut skip = false;
         for plugin in &mut self.lifecycle_plugins {
@@ -644,7 +646,7 @@ impl ContextWeaver {
             .max_iterations(10_000)
             .lenient(self.config.lenient);
 
-        let result = weaver_lang::evaluate_with_options(
+        let result = weaver_lang::evaluate_value_with_options(
             entry.compiled.ast(),
             &mut self.host,
             &self.registry,
@@ -653,10 +655,11 @@ impl ContextWeaver {
 
         self.host.end_entry();
 
-        let mut content = result.map_err(|e| ContextWeaverError::Eval {
+        let value = result.map_err(|e| ContextWeaverError::Eval {
             entry_id: entry.meta.id.clone(),
             source: e,
         })?;
+        let mut content = value.to_output_string();
 
         // ── Lifecycle: post_evaluate ────────────────────────────────
         for plugin in &mut self.lifecycle_plugins {
@@ -674,7 +677,36 @@ impl ContextWeaver {
                 })?;
         }
 
-        Ok(Some(content))
+        Ok(Some((value, content)))
+    }
+
+    /// Evaluate one entry on demand and return its [`Value`].
+    ///
+    /// The value-oriented counterpart to [`assemble`](Self::assemble), for
+    /// hosts that use a lorebook entry as data rather than prose.
+    pub fn evaluate_entry_value(
+        &mut self,
+        book: BookId,
+        entry_id: &str,
+    ) -> Result<Option<Value>, ContextWeaverError> {
+        let entry = self
+            .books
+            .get(book)
+            .and_then(|b| b.get_entry(entry_id))
+            .cloned()
+            .ok_or_else(|| ContextWeaverError::EntryNotFound {
+                entry_id: entry_id.to_string(),
+            })?;
+
+        // `[[document]]` resolution reads the host's template store, which
+        // `assemble` refreshes each pass; a standalone call has to do the
+        // same or nested references would resolve against a stale set.
+        let book_templates = self.build_book_templates();
+        self.host.set_book_templates(book_templates);
+
+        Ok(self
+            .evaluate_single_entry(book, &entry)?
+            .map(|(value, _content)| value))
     }
 
     /// Install a custom [`IdResolver`] for document id resolution.
@@ -686,11 +718,12 @@ impl ContextWeaver {
     }
 }
 
-/// An entry that has been evaluated to its final string content.
+/// An entry that has been evaluated, ready for assembly.
 pub struct EvaluatedEntry {
     pub id: String,
     pub meta: EntryMeta,
     pub content: String,
+    pub value: Value,
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────
@@ -711,6 +744,8 @@ pub enum ContextWeaverError {
     },
     /// A document reference hit the recursion limit.
     RecursionLimit { entry_id: String, depth: usize },
+    /// No entry with this id exists in the requested book.
+    EntryNotFound { entry_id: String },
     /// I/O error loading lorebook files.
     Io(std::io::Error),
     PluginHook {
@@ -741,6 +776,9 @@ impl std::fmt::Display for ContextWeaverError {
             }
             Self::RecursionLimit { entry_id, depth } => {
                 write!(f, "recursion limit ({depth}) hit from entry '{entry_id}'")
+            }
+            Self::EntryNotFound { entry_id } => {
+                write!(f, "no such entry: '{entry_id}'")
             }
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::PluginHook {

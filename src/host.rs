@@ -6,6 +6,9 @@
 //! - **Read-only enforcement** for host-provided variables
 //! - **Trigger handling** that records activations without producing output
 //! - **Document resolution** with recursive entry evaluation and cycle detection
+//! - **Document values**: an entry ending in `{# return expr #}` resolves to
+//!   that [`Value`], so `[[some_id]]` can hand structured data to the
+//!   including template instead of rendered text
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -408,6 +411,16 @@ impl EvalContext for WeaverHost {
         document_id: &str,
         registry: &Registry,
     ) -> Result<String, EvalError> {
+        Ok(self
+            .resolve_document_value(document_id, registry)?
+            .to_output_string())
+    }
+
+    fn resolve_document_value(
+        &mut self,
+        document_id: &str,
+        registry: &Registry,
+    ) -> Result<Value, EvalError> {
         // The currently-evaluating entry's book is the "local" book:
         // references resolve there first, then fall back to other books.
         let origin = self.eval_stack.last().map(|(book, _)| *book);
@@ -451,9 +464,8 @@ impl EvalContext for WeaverHost {
             ));
         }
 
-        // ── Evaluate ──────────────────────────────────────────────
         self.eval_stack.push(frame);
-        let result = weaver_lang::evaluate(template.ast(), self, registry);
+        let result = weaver_lang::evaluate_value(template.ast(), self, registry);
         self.eval_stack.pop();
 
         result
@@ -729,6 +741,93 @@ mod tests {
 
         let result = host.resolve_document("doc_a", &registry).unwrap();
         assert_eq!(result, "Hello, world!");
+    }
+
+    // ── Document values (weaver_lang 0.6 return statements) ─────────
+
+    #[test]
+    fn test_document_value_preserves_returned_array() {
+        let mut host = make_host();
+        let registry = Registry::new();
+
+        let template =
+            Arc::new(CompiledTemplate::compile(r#"{# return ["sword", "shield"] #}"#).unwrap());
+        host.set_entry_templates(HashMap::from([("loot".to_string(), template)]));
+
+        let value = host.resolve_document_value("loot", &registry).unwrap();
+        assert_eq!(
+            value,
+            Value::Array(vec![
+                Value::String("sword".into()),
+                Value::String("shield".into())
+            ])
+        );
+
+        // The string path is the same value, rendered.
+        assert_eq!(
+            host.resolve_document("loot", &registry).unwrap(),
+            "sword, shield"
+        );
+    }
+
+    #[test]
+    fn test_document_without_return_is_string_value() {
+        let mut host = make_host();
+        let registry = Registry::new();
+
+        let template = Arc::new(CompiledTemplate::compile("Name: {{char:name}}").unwrap());
+        host.set_entry_templates(HashMap::from([("char_doc".to_string(), template)]));
+
+        let value = host.resolve_document_value("char_doc", &registry).unwrap();
+        assert_eq!(value, Value::String("Name: Aria".into()));
+    }
+
+    #[test]
+    fn test_returned_array_is_iterable_from_including_entry() {
+        let mut host = make_host();
+        let registry = Registry::new();
+
+        let loot =
+            Arc::new(CompiledTemplate::compile(r#"{# return ["sword", "shield"] #}"#).unwrap());
+        let listing = Arc::new(
+            CompiledTemplate::compile("{# foreach item in [[loot]] #}- {{item}}\n{# endforeach #}")
+                .unwrap(),
+        );
+        host.set_entry_templates(HashMap::from([
+            ("loot".to_string(), loot),
+            ("listing".to_string(), listing),
+        ]));
+
+        let result = host.resolve_document("listing", &registry).unwrap();
+        assert_eq!(result, "- sword\n- shield\n");
+    }
+
+    #[test]
+    fn test_document_bare_return_yields_none() {
+        let mut host = make_host();
+        let registry = Registry::new();
+
+        let template = Arc::new(CompiledTemplate::compile("drafted{# return #}").unwrap());
+        host.set_entry_templates(HashMap::from([("guarded".to_string(), template)]));
+
+        assert_eq!(
+            host.resolve_document_value("guarded", &registry).unwrap(),
+            Value::None
+        );
+        assert_eq!(host.resolve_document("guarded", &registry).unwrap(), "");
+    }
+
+    #[test]
+    fn test_document_value_still_detects_cycles() {
+        let mut host = make_host();
+        let registry = Registry::new();
+
+        let template = Arc::new(CompiledTemplate::compile("{# return [[entry_a]] #}").unwrap());
+        host.set_entry_templates(HashMap::from([("entry_a".to_string(), template)]));
+
+        let result = host.resolve_document_value("entry_a", &registry);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("cycle"));
     }
 
     #[test]

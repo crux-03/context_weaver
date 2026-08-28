@@ -150,6 +150,44 @@ my_character/
 * **Token budgets** at the global level, with optional per-group budgets for entries that share a named pool.
 * **Priority and insertion order** as the tie-breakers within a slot.
 
+### Entry values
+
+Entries are not limited to prose. An entry whose template ends in
+`{# return expr #}` produces a **value**, and the entry becomes a data
+source other entries can consume:
+
+```text
+// loot_table.weaver
+{# return ["sword", "shield", "potion"] #}
+
+// listing.weaver
+Loot:
+{# foreach item in [[loot_table]] #}
+- {{item}}
+{# endforeach #}
+```
+
+The array crosses the `[[...]]` reference as an array, so the loop walks
+its items rather than a joined string. An entry without a `return` is
+still a value — the string it rendered — so nothing changes for existing
+entries.
+
+* **`{# return #}`** (bare) yields `none`: the entry renders to nothing
+  and the assembler drops it, which makes it a clean guard —
+  `{# if {{state:hp}} > 50 #}{# return #}{# endif #}` in front of a wound
+  description.
+* **`{# stop #}`** keeps the text rendered before it and discards the
+  rest, truncating rather than replacing.
+* **`ContextWeaver::evaluate_entry_value`** evaluates one entry on demand
+  and hands back its `Value`, for hosts that read an entry as a table or
+  a config block instead of prompt text.
+* **`EvaluatedEntry::value`** carries the same value through the pipeline
+  alongside the `content` string the assembler places in the prompt.
+
+An entry that needs to emit prose *and* hand the host a payload should
+stash the payload with `$[set_var("state:tags", ...)]` and not return at
+all; `{# return #}` discards the prose.
+
 ### Host context
 
 * **Namespaces** with configurable access (`ReadOnly` for host-provided data like `char`, `user`, `chat`; `ReadWrite` for template-mutable state like `state` and `local`). Each lorebook may define auxiliary namespaces, and multiple books can target the same namespace with differing (or equal) permissions.
