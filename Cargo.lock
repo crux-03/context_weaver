@@ -581,9 +581,9 @@ dependencies = [
 
 [[package]]
 name = "weaver_lang"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e80caeb01c8c828b2833cf03ddb2e963de3ae8a4c11a73b11fbd0b93d915e514"
+checksum = "a5e1fd9693c0825d618a5090aa9477f707f7cc87f367a1df2e1b79b25553be01"
 dependencies = [
  "pest",
  "pest_derive",

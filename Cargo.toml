@@ -12,7 +12,7 @@ default = ["stdlib"]
 stdlib = []
 
 [dependencies]
-weaver_lang = { version="0.6.0", features = ["macros"] }
+weaver_lang = { version="0.7.0", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 regex = "1"
